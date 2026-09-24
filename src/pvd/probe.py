@@ -1,0 +1,276 @@
+"""Frozen-embedding linear probe: CV tuning, save/load, training (M4, §9.8).
+
+The probe is a logistic regression on cached embeddings. It retrains in seconds,
+which is what makes the review loop responsive. Cross-validation picks the
+regularization strength; the review loop reuses the last chosen ``C`` for speed.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+import joblib
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+
+from .config import Config
+from .evaluate import evaluate_arrays, render_report, resolve_test_set, write_report
+from .features import get_features
+from .labels import effective_labels, label_snapshot_sha
+from .scan import load_manifest
+
+log = logging.getLogger(__name__)
+
+MIN_TRAIN_PER_CLASS = 5
+
+
+@dataclass
+class ProbeBundle:
+    """Everything needed to reproduce and validate a trained probe (§8.4)."""
+
+    kind: str
+    classes: list[str]
+    backbone_id: str
+    feature_dim: int
+    estimator: object
+    feature_meta: dict = field(default_factory=dict)
+    best_C: float | None = None
+    cv_balanced_accuracy: float | None = None
+    test_metrics: dict | None = None
+    n_train: int = 0
+    label_snapshot_sha: str = ""
+    config: dict = field(default_factory=dict)
+    created: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    versions: dict = field(default_factory=dict)
+
+
+def _versions() -> dict:
+    import sklearn
+    import torch
+
+    versions = {"torch": torch.__version__, "sklearn": sklearn.__version__}
+    try:
+        import open_clip
+
+        versions["open_clip"] = open_clip.__version__
+    except Exception:  # pragma: no cover
+        pass
+    return versions
+
+
+def make_estimator(C: float, config: Config) -> LogisticRegression:
+    return LogisticRegression(
+        C=C,
+        class_weight=config.probe.class_weight,
+        max_iter=config.probe.max_iter,
+    )
+
+
+def _pick_best_C(search: GridSearchCV) -> float:
+    """Choose the strongest regularization that still gives the best CV score.
+
+    When several ``C`` values tie on balanced accuracy (common once classes are
+    separable), GridSearchCV returns the first/smallest. That heavily regularizes
+    and squashes predicted probabilities toward 0.5, which makes any confidence
+    threshold useless. We prefer the largest tied ``C`` for sharper, still-honest
+    probabilities.
+    """
+    scores = np.asarray(search.cv_results_["mean_test_score"], dtype=float)
+    candidates = np.asarray([float(c) for c in search.cv_results_["param_C"]], dtype=float)
+    tied = candidates[scores >= scores.max() - 1e-9]
+    return float(tied.max())
+
+
+def train_probe(
+    X: np.ndarray,
+    y: np.ndarray,
+    config: Config,
+    *,
+    classes: list[str],
+    backbone_id: str,
+    feature_meta: dict | None = None,
+    test_metrics: dict | None = None,
+    label_snapshot: str = "",
+) -> ProbeBundle:
+    """Grid-search ``C`` by stratified CV and fit the final estimator (G13)."""
+    if len(X) != len(y):
+        raise ValueError("X and y must have the same length")
+    positive, counts = np.unique(y, return_counts=True)
+    if len(positive) < 2:
+        raise ValueError("Need at least two classes with labels to train a probe")
+    if counts.min() < 2:
+        raise ValueError("Each class needs at least two labeled examples for CV")
+
+    folds = min(config.probe.cv_folds, int(counts.min()))
+    search = GridSearchCV(
+        make_estimator(1.0, config),
+        {"C": config.probe.C_grid},
+        scoring="balanced_accuracy",
+        cv=StratifiedKFold(n_splits=max(2, folds), shuffle=True, random_state=config.seed),
+        n_jobs=1,
+    )
+    search.fit(X, y)
+    best_C = _pick_best_C(search)
+    estimator = make_estimator(best_C, config).fit(X, y)
+    log.info("Probe: best C=%.3g, CV balanced accuracy=%.3f", best_C, search.best_score_)
+
+    return ProbeBundle(
+        kind="probe",
+        classes=list(classes),
+        backbone_id=backbone_id,
+        feature_dim=int(X.shape[1]),
+        estimator=estimator,
+        feature_meta=feature_meta or {},
+        best_C=best_C,
+        cv_balanced_accuracy=float(search.best_score_),
+        test_metrics=test_metrics,
+        n_train=int(len(y)),
+        label_snapshot_sha=label_snapshot,
+        config=config.to_dict(),
+        versions=_versions(),
+    )
+
+
+def quick_retrain(
+    X: np.ndarray, y: np.ndarray, C: float, config: Config
+) -> LogisticRegression:
+    """Fit without cross-validation, reusing the last chosen ``C`` (NF2)."""
+    return make_estimator(C, config).fit(X, y)
+
+
+def save(bundle: ProbeBundle, path: Path) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(bundle, path)
+    log.info("Saved model bundle: %s", path)
+    return path
+
+
+def load(
+    path: Path,
+    expect_backbone_id: str | None = None,
+    expect_dim: int | None = None,
+) -> ProbeBundle:
+    """Load a bundle, refusing mismatched feature recipes (G8)."""
+    bundle: ProbeBundle = joblib.load(path)
+    if not isinstance(bundle, ProbeBundle):
+        raise ValueError(f"{path} is not a ProbeBundle")
+    if expect_backbone_id is not None and bundle.backbone_id != expect_backbone_id:
+        raise ValueError(
+            f"Model was trained on backbone {bundle.backbone_id!r} but "
+            f"{expect_backbone_id!r} was requested. Retrain or pick the right model."
+        )
+    if expect_dim is not None and bundle.feature_dim != expect_dim:
+        raise ValueError(
+            f"Model expects {bundle.feature_dim} features but got {expect_dim}."
+        )
+    return bundle
+
+
+def load_latest(config: Config, kind: str = "probe") -> Path:
+    """Newest ``models/*.joblib`` matching the bundle kind."""
+    candidates = sorted(config.models_dir.glob("*.joblib"), key=lambda p: p.stat().st_mtime)
+    for path in reversed(candidates):
+        try:
+            bundle = joblib.load(path)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(bundle, ProbeBundle) and bundle.kind == kind:
+            return path
+    raise FileNotFoundError(
+        f"No {kind} model found in {config.models_dir}. Run `pvd train` first."
+    )
+
+
+def _evaluate_bundle(config: Config, bundle: ProbeBundle):
+    """Evaluate a bundle on the test set; return an EvalResult or None."""
+    try:
+        test = resolve_test_set(config)
+    except ValueError as exc:
+        log.warning("Skipping test evaluation: %s", exc)
+        return None
+    if set(bundle.classes) != set(config.classes):
+        log.warning(
+            "Bundle classes %s differ from config classes %s; skipping eval",
+            bundle.classes,
+            config.classes,
+        )
+        return None
+
+    features = get_features(config, test.shas, test.paths, backbone_id=bundle.backbone_id)
+    if features.shape[1] != bundle.feature_dim:
+        raise ValueError(
+            f"Feature dim {features.shape[1]} != model dim {bundle.feature_dim}. "
+            "Re-run `pvd embed` with the model's backbone/feature settings."
+        )
+    probs = bundle.estimator.predict_proba(features)
+    return evaluate_arrays(test.y_true, probs, bundle.classes, test.frame, test.tags)
+
+
+def run_train(config: Config) -> Path:
+    """Train and save a probe from the current effective labels."""
+    manifest = load_manifest(config)
+    labels = effective_labels(config, manifest)
+    if labels.empty:
+        raise ValueError(
+            "No labeled training data. Add examples to data/seed/<class>/ or label "
+            "images in `pvd review` first."
+        )
+
+    class_to_index = {name: i for i, name in enumerate(config.classes)}
+    counts = labels["label"].value_counts()
+    small = [name for name in config.classes if counts.get(name, 0) < MIN_TRAIN_PER_CLASS]
+    if small:
+        raise ValueError(
+            f"Not enough labeled examples for {small} (need >= {MIN_TRAIN_PER_CLASS} "
+            "each). Falling back to zero-shot is recommended; add more seed images."
+        )
+
+    shas = labels["sha1"].tolist()
+    paths = [str(config.resolve(p)) for p in labels["path"].tolist()]
+    X = get_features(config, shas, paths)
+    y = np.array([class_to_index[label] for label in labels["label"]], dtype=int)
+
+    bundle = train_probe(
+        X,
+        y,
+        config,
+        classes=list(config.classes),
+        backbone_id=config.backbone.id,
+        feature_meta={"feature_key": config.backbone.id, "dim": int(X.shape[1])},
+        label_snapshot=label_snapshot_sha(labels),
+    )
+
+    result = _evaluate_bundle(config, bundle)
+    if result is not None:
+        bundle.test_metrics = {
+            "accuracy": result.accuracy,
+            "balanced_accuracy": result.balanced_accuracy,
+            "auc": result.auc,
+            "per_tag": result.per_tag,
+            "recommended_threshold": result.recommended_threshold,
+        }
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = save(bundle, config.models_dir / f"probe_{stamp}.joblib")
+
+    lines = [
+        f"- Training examples: **{bundle.n_train}**",
+        f"- Best C: **{bundle.best_C}**",
+        f"- CV balanced accuracy: **{bundle.cv_balanced_accuracy:.3f}**",
+        f"- Label snapshot: `{bundle.label_snapshot_sha[:12]}`",
+        f"- Bundle: `{path.name}`",
+        "",
+    ]
+    if result is not None:
+        lines.insert(2, f"- Test balanced accuracy: **{result.balanced_accuracy:.3f}**")
+        report = write_report(config, "train", render_report("probe", result, lines))
+    else:
+        report = write_report(config, "train", "# Training report\n\n" + "\n".join(lines))
+
+    log.info("Training report: %s", report)
+    return path

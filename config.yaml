@@ -1,0 +1,86 @@
+# Photo-vs-drawing classifier configuration.
+# Every field has a built-in default; delete anything you do not want to override.
+
+project_root: .
+# Class order defines class indices and report/CSV column order. Works for N >= 2.
+classes: [photo, drawing]
+# Reserved pseudo-label. Never a class; used for junk/out-of-domain images.
+skip_label: skip
+
+paths:
+  pool: data/pool          # unlabeled images to review
+  seed: data/seed          # expects data/seed/<class>/
+  test: data/test          # expects data/test/<class>/[<tag>/]
+  cache: cache
+  labels: labels/events.jsonl
+  models: models
+  reports: reports
+
+image:
+  alpha_background: [255, 255, 255]   # composite transparent PNGs onto this
+  max_pixels: 80000000                # refuse decompression bombs above this
+  extensions: [.jpg, .jpeg, .png, .webp, .bmp, .gif, .tif, .tiff]
+
+device: auto                # auto | cuda | mps | cpu
+num_workers: 2              # 0 is always safe (Windows/macOS spawn)
+
+backbone:
+  id: clip_b32              # clip_b32 | clip_l14 | siglip_so400m | dinov2_s | dinov2_b | fake
+  batch_size: 32
+  tiles:
+    enabled: false          # native-resolution tiling (helps texture; slower)
+    count: 5
+    max_side: 1536
+  extra_features:
+    deepghs_real: false     # append deepghs anime/real score (requires dghs-imgutils)
+
+zeroshot:
+  prompts:
+    photo:
+      - a photograph
+      - a photo taken with a camera
+      - a smartphone photo
+      - a DSLR photograph
+      - a candid photo of real life
+      - a black and white photograph
+    drawing:
+      - a drawing
+      - a digital illustration
+      - an anime illustration
+      - a painting
+      - a pencil sketch
+      - a realistic digital painting
+      - concept art
+      - a manga page
+
+probe:
+  C_grid: [0.01, 0.1, 1, 10, 100]
+  cv_folds: 5
+  class_weight: balanced
+  max_iter: 5000
+
+review:
+  batch_size: 24
+  random_fraction: 0.25     # share of each batch drawn at random (unbiased error rate)
+  diversity: true           # avoid near-identical uncertain images in one batch
+  undo_depth: 20
+  retrain_every_batch: true
+
+predict:
+  unsure_threshold: 0.80    # max prob below this -> "unsure"
+  mode: copy                # copy | move | csv_only
+
+finetune:
+  model_name: convnext_tiny # any timm model; alternatives: efficientnet_b0, vit_small_patch16_224
+  pretrained: true
+  image_size: 384           # texture detail matters; lower if memory is tight
+  epochs: 8
+  batch_size: 16
+  lr_head: 0.001
+  lr_backbone: 0.0001
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  val_fraction: 0.15
+  early_stopping_patience: 3
+
+seed: 1234

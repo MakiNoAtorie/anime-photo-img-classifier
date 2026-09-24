@@ -16,6 +16,17 @@ log = logging.getLogger(__name__)
 MPS_FALLBACK_ENV = "PYTORCH_ENABLE_MPS_FALLBACK"
 
 
+_logged: set[str] = set()
+
+
+def _log_once(message: str, *args) -> None:
+    """Log a device message only the first time it occurs in this process."""
+    text = message % args
+    if text not in _logged:
+        _logged.add(text)
+        log.info(text)
+
+
 def pick_device(pref: str = "auto") -> str:
     """Return ``'cuda'``, ``'mps'`` or ``'cpu'``.
 
@@ -34,12 +45,12 @@ def pick_device(pref: str = "auto") -> str:
     if pref == "auto":
         for candidate in ("cuda", "mps", "cpu"):
             if available[candidate]:
-                log.info("Using device: %s", candidate)
+                _log_once("Using device: %s", candidate)
                 return candidate
         return "cpu"
 
     if pref in available and available[pref]:
-        log.info("Using device: %s", pref)
+        _log_once("Using device: %s", pref)
         return pref
 
     log.warning("Requested device %r unavailable (available=%s); falling back to cpu", pref, available)

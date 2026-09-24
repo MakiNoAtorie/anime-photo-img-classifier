@@ -82,8 +82,8 @@ class ImageConfig(BaseModel):
 
     alpha_background: tuple[int, int, int] = (255, 255, 255)
     # Checked from the header before decoding; must be > 0 (0 would disable the
-    # decompression-bomb guard).
-    max_pixels: int = Field(default=80_000_000, gt=0, le=400_000_000)
+    # guard). Pillow itself refuses anything above ~178 MP, hence the cap.
+    max_pixels: int = Field(default=80_000_000, gt=0, le=178_000_000)
     extensions: list[str] = Field(default_factory=lambda: list(DEFAULT_EXTENSIONS))
 
     @field_validator("extensions")

@@ -48,7 +48,11 @@ def _guard(func):
         try:
             return func(*args, **kwargs)
         except _USER_ERRORS as exc:
+            # With --verbose, keep the traceback: a RuntimeError may be a bug.
+            log.debug("Command failed", exc_info=True)
             typer.secho(f"Error: {exc}", fg=typer.colors.RED, err=True)
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                typer.secho("(traceback above; run without --verbose to hide it)", err=True)
             raise typer.Exit(code=1) from exc
 
     wrapper.__annotations__ = getattr(func, "__annotations__", {})
@@ -143,7 +147,7 @@ def train(ctx: typer.Context) -> None:
 @_command()
 def eval(
     ctx: typer.Context,
-    model: Path = typer.Option(None, "--model", help="Model bundle (defaults to newest probe)."),
+    model: Path = typer.Option(None, "--model", help="Model bundle (defaults to the newest probe or fine-tune)."),
 ) -> None:
     """Full evaluation report of a saved model on the held-out test set."""
     from .evaluate import run_eval
@@ -186,7 +190,7 @@ def predict(
     ctx: typer.Context,
     src: Path = typer.Option(..., "--src", help="Folder of new images to sort."),
     dst: Path = typer.Option(..., "--dst", help="Output folder."),
-    model: Path = typer.Option(None, "--model", help="Model bundle; defaults to newest probe."),
+    model: Path = typer.Option(None, "--model", help="Model bundle (defaults to the newest probe or fine-tune)."),
     threshold: float = typer.Option(None, "--threshold", help="Max-probability cutoff for 'unsure'."),
     mode: str = typer.Option(None, "--mode", help="copy | move | csv_only"),
     yes: bool = typer.Option(False, "--yes", help="Required to allow --mode move."),

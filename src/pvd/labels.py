@@ -267,11 +267,14 @@ def run_export(config: Config, fmt: str = "folders", out: Path = Path("export"))
         target_dir.mkdir(parents=True, exist_ok=True)
         source = config.resolve(row["path"])
         target = target_dir / f"{row['sha1'][:8]}_{source.name}"
-        if target.exists():
+        # is_symlink() also catches a dangling link, which exists() misses;
+        # copying "through" it would write wherever the link points.
+        if target.exists() or target.is_symlink():
             continue
         try:
             target.symlink_to(source.resolve())
-        except OSError:
+        except (OSError, NotImplementedError):
+            # e.g. Windows without the symlink privilege: fall back to a copy.
             import shutil
 
             shutil.copy2(source, target)

@@ -15,7 +15,9 @@ from .base import Backbone
 MODEL_REGISTRY: dict[str, tuple[str, str, str | None]] = {
     "clip_b32": ("clip", "ViT-B-32", "laion2b_s34b_b79k"),
     "clip_l14": ("clip", "ViT-L-14", "laion2b_s32b_b82k"),
-    "siglip_so400m": ("clip", "ViT-SO400M-14-SigLIP", "webli"),
+    "siglip_so400m": ("clip", "ViT-SO400M-14-SigLIP", "webli"),  # 224 px
+    # 384 px input keeps more texture evidence (G24); slower.
+    "siglip_so400m_384": ("clip", "ViT-SO400M-14-SigLIP-384", "webli"),
     "dinov2_s": ("dinov2", "vit_small_patch14_dinov2", None),
     "dinov2_b": ("dinov2", "vit_base_patch14_dinov2", None),
 }

@@ -33,11 +33,24 @@ try:  # pragma: no cover - depends on optional package
 except Exception:  # pragma: no cover
     pass
 
-# Hard safety net against absurd decompression bombs. The *configurable* limit
-# is enforced by ``_enforce_size`` so that per-call ``max_pixels`` does not leak
-# into Pillow's global state.
-_PIL_MAX_PIXELS = 200_000_000
-Image.MAX_IMAGE_PIXELS = _PIL_MAX_PIXELS
+# Pillow's own decompression-bomb guard stays at its default (it errors above
+# 2x MAX_IMAGE_PIXELS). The project's configurable, stricter limit
+# (``image.max_pixels``) is checked from the header by ``_enforce_size`` before
+# any pixels are decoded, so it never needs to change Pillow's global state.
+
+# Decoders Pillow may use. Pillow picks a decoder from the file *content*, not
+# the extension, so without this list a file named `x.jpg` could reach rarely
+# used decoders (EPS hands the file to Ghostscript, PSD has had memory bugs).
+# JPEG also covers MPO (multi-picture JPEGs from phones); HEIF is added only
+# when the optional pillow-heif opener is installed.
+_ALLOWED_FORMATS = ["JPEG", "PNG", "WEBP", "BMP", "GIF", "TIFF"]
+
+
+def allowed_formats() -> list[str]:
+    """Pillow format names this project will decode."""
+    extra = [name for name in ("HEIF",) if name in Image.OPEN]
+    return _ALLOWED_FORMATS + extra
+
 
 # Modes that carry an alpha channel.
 _ALPHA_MODES = {"RGBA", "LA", "PA", "RGBa", "La"}
@@ -120,7 +133,7 @@ def probe_image(path: Path) -> ImageInfo:
     separately by :func:`load_rgb` when a full decode is required.
     """
     try:
-        with Image.open(path) as im:
+        with Image.open(path, formats=allowed_formats()) as im:
             return _read_info(im)
     except Image.DecompressionBombError as exc:
         raise ImageLoadError("too_large", str(exc)) from exc
@@ -175,7 +188,7 @@ def load_rgb(
     and detached from the file handle.
     """
     try:
-        with Image.open(path) as im:
+        with Image.open(path, formats=allowed_formats()) as im:
             _enforce_size(im, max_pixels)
             try:
                 im.seek(0)  # first frame of animated GIFs/WebP

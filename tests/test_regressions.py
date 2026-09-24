@@ -691,3 +691,39 @@ def test_predict_does_not_overwrite_previous_csv(tmp_project: Config) -> None:
     first = run_predict(tmp_project, src, dst, mode="csv_only")
     second = run_predict(tmp_project, src, dst, mode="csv_only")
     assert first != second and first.exists() and second.exists()
+
+
+# --------------------------------------------------------------------------- #
+# #22, #24 security hardening
+# --------------------------------------------------------------------------- #
+def test_non_allowlisted_format_is_rejected(tmp_path: Path) -> None:
+    from PIL import Image
+
+    from pvd.imageio import ImageLoadError, load_rgb, probe_image
+
+    # A real image in a format outside the allowlist, disguised as .jpg.
+    disguised = tmp_path / "x.jpg"
+    Image.new("RGB", (8, 8)).save(disguised, format="PCX")
+    with pytest.raises(ImageLoadError):
+        probe_image(disguised)
+    with pytest.raises(ImageLoadError):
+        load_rgb(disguised)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_export_never_writes_through_dangling_symlink(tmp_project: Config) -> None:
+    from pvd.labels import run_export
+
+    cfg = _fake(tmp_project)
+    _seed(cfg, n=1, test=0)
+    run_scan(cfg)
+    manifest = load_manifest(cfg)
+    row = manifest[manifest["folder_label"] == "photo"].iloc[0]
+    out = cfg.project_root / "export"
+    (out / "photo").mkdir(parents=True)
+    outside = cfg.project_root / "outside.png"
+    name = f"{row['sha1'][:8]}_{Path(row['path']).name}"
+    (out / "photo" / name).symlink_to(outside)  # dangling: target doesn't exist
+
+    run_export(cfg, fmt="folders", out=out)
+    assert not outside.exists()

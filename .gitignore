@@ -10,6 +10,7 @@ cache/
 models/
 labels/
 reports/
+export/
 data/pool/*
 data/seed/*
 data/test/*
@@ -19,3 +20,7 @@ data/test/*
 *.joblib
 *.parquet
 *.npz
+
+# Local Claude Code state (personal, never shared)
+.claude/agent-memory-local/
+.claude/settings.local.json

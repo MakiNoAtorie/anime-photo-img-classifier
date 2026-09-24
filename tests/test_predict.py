@@ -10,7 +10,7 @@ import pytest
 from _imagegen import drawing_image, photo_image, zero_byte
 from pvd.config import Config
 from pvd.predict import run_predict
-from pvd.predict_utils import unique_destination
+from pvd.predict import unique_destination
 from pvd.probe import run_train
 from pvd.scan import run_scan
 

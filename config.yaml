@@ -19,7 +19,7 @@ paths:
 image:
   alpha_background: [255, 255, 255]   # composite transparent PNGs onto this
   max_pixels: 80000000                # refuse decompression bombs above this
-  extensions: [.jpg, .jpeg, .png, .webp, .bmp, .gif, .tif, .tiff]
+  extensions: [.jpg, .jpeg, .png, .webp, .bmp, .gif, .tif, .tiff, .heic, .heif]
 
 device: auto                # auto | cuda | mps | cpu
 num_workers: 2              # 0 is always safe (Windows/macOS spawn)
@@ -65,13 +65,14 @@ review:
   diversity: true           # avoid near-identical uncertain images in one batch
   undo_depth: 20
   retrain_every_batch: true
+  cv_every: 10              # full cross-validated retrain every N batches (fast refit in between)
 
 predict:
   unsure_threshold: 0.80    # max prob below this -> "unsure"
   mode: copy                # copy | move | csv_only
 
 finetune:
-  model_name: convnext_tiny # any timm model; alternatives: efficientnet_b0, vit_small_patch16_224
+  model_name: convnext_tiny.fb_in22k_ft_in1k # any timm model; alternatives: efficientnet_b0, vit_small_patch16_224
   pretrained: true
   image_size: 384           # texture detail matters; lower if memory is tight
   epochs: 8

@@ -18,8 +18,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
 
 from .config import Config
-from .evaluate import evaluate_arrays, render_report, resolve_test_set, write_report
-from .features import get_features
+from .evaluate import evaluate_bundle, render_report, resolve_test_set, write_report
+from .features import feature_recipe, get_features, load_feature_meta
 from .labels import effective_labels, label_snapshot_sha
 from .scan import load_manifest
 
@@ -38,6 +38,10 @@ class ProbeBundle:
     feature_dim: int
     estimator: object
     feature_meta: dict = field(default_factory=dict)
+    #: Full cache key (backbone + tiles/extra/background suffixes) and the recipe
+    #: that produced it, so predict/eval rebuild exactly these features (G8).
+    feature_key: str = ""
+    feature_recipe: dict = field(default_factory=dict)
     best_C: float | None = None
     cv_balanced_accuracy: float | None = None
     test_metrics: dict | None = None
@@ -63,6 +67,7 @@ def _versions() -> dict:
 
 
 def make_estimator(C: float, config: Config) -> LogisticRegression:
+    """The probe's estimator: balanced class weights so imbalance can't bias it (G27)."""
     return LogisticRegression(
         C=C,
         class_weight=config.probe.class_weight,
@@ -95,13 +100,17 @@ def train_probe(
     feature_meta: dict | None = None,
     test_metrics: dict | None = None,
     label_snapshot: str = "",
+    recipe: dict | None = None,
 ) -> ProbeBundle:
     """Grid-search ``C`` by stratified CV and fit the final estimator (G13)."""
     if len(X) != len(y):
         raise ValueError("X and y must have the same length")
-    positive, counts = np.unique(y, return_counts=True)
-    if len(positive) < 2:
-        raise ValueError("Need at least two classes with labels to train a probe")
+    counts = np.bincount(y, minlength=len(classes))
+    if len(counts) != len(classes) or (counts == 0).any():
+        # predict_proba would return fewer columns than there are classes and
+        # every caller indexing columns by class position would be misaligned.
+        missing = [name for name, n in zip(classes, counts) if n == 0]
+        raise ValueError(f"Every class needs labeled examples to train a probe; missing: {missing}")
     if counts.min() < 2:
         raise ValueError("Each class needs at least two labeled examples for CV")
 
@@ -125,6 +134,8 @@ def train_probe(
         feature_dim=int(X.shape[1]),
         estimator=estimator,
         feature_meta=feature_meta or {},
+        feature_key=(recipe or {}).get("feature_key", ""),
+        feature_recipe=recipe or {},
         best_C=best_C,
         cv_balanced_accuracy=float(search.best_score_),
         test_metrics=test_metrics,
@@ -143,6 +154,7 @@ def quick_retrain(
 
 
 def save(bundle: ProbeBundle, path: Path) -> Path:
+    """Write a bundle with joblib (a pickle: only load bundles you trust)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(bundle, path)
@@ -172,24 +184,16 @@ def load(
 
 
 def load_latest(config: Config, kind: str = "probe") -> Path:
-    """Newest ``models/*.joblib`` matching the bundle kind."""
-    candidates = sorted(config.models_dir.glob("*.joblib"), key=lambda p: p.stat().st_mtime)
-    for path in reversed(candidates):
-        try:
-            bundle = joblib.load(path)
-        except Exception:  # noqa: BLE001
-            continue
-        if isinstance(bundle, ProbeBundle) and bundle.kind == kind:
-            return path
-    raise FileNotFoundError(
-        f"No {kind} model found in {config.models_dir}. Run `pvd train` first."
-    )
+    """Newest ``models/<kind>_*.joblib`` (chosen by name, without unpickling)."""
+    from .models import newest_bundle_path
+
+    return newest_bundle_path(config, (kind,))
 
 
-def _evaluate_bundle(config: Config, bundle: ProbeBundle):
+def _evaluate_bundle(config: Config, bundle: ProbeBundle, manifest=None):
     """Evaluate a bundle on the test set; return an EvalResult or None."""
     try:
-        test = resolve_test_set(config)
+        test = resolve_test_set(config, manifest)
     except ValueError as exc:
         log.warning("Skipping test evaluation: %s", exc)
         return None
@@ -200,15 +204,7 @@ def _evaluate_bundle(config: Config, bundle: ProbeBundle):
             config.classes,
         )
         return None
-
-    features = get_features(config, test.shas, test.paths, backbone_id=bundle.backbone_id)
-    if features.shape[1] != bundle.feature_dim:
-        raise ValueError(
-            f"Feature dim {features.shape[1]} != model dim {bundle.feature_dim}. "
-            "Re-run `pvd embed` with the model's backbone/feature settings."
-        )
-    probs = bundle.estimator.predict_proba(features)
-    return evaluate_arrays(test.y_true, probs, bundle.classes, test.frame, test.tags)
+    return evaluate_bundle(config, bundle, test)
 
 
 def run_train(config: Config) -> Path:
@@ -227,25 +223,31 @@ def run_train(config: Config) -> Path:
     if small:
         raise ValueError(
             f"Not enough labeled examples for {small} (need >= {MIN_TRAIN_PER_CLASS} "
-            "each). Falling back to zero-shot is recommended; add more seed images."
+            "each). Until then use `pvd zeroshot`, or add seed images / label more "
+            "in `pvd review` (which uses zero-shot until every class has enough)."
         )
 
     shas = labels["sha1"].tolist()
     paths = [str(config.resolve(p)) for p in labels["path"].tolist()]
-    X = get_features(config, shas, paths)
+    X, valid = get_features(config, shas, paths, return_mask=True)
+    if not valid.all():
+        log.warning("Dropping %d labeled image(s) without embeddings.", int((~valid).sum()))
+        X, labels = X[valid], labels[valid].reset_index(drop=True)
     y = np.array([class_to_index[label] for label in labels["label"]], dtype=int)
 
+    recipe = feature_recipe(config.backbone.id, config)
     bundle = train_probe(
         X,
         y,
         config,
         classes=list(config.classes),
         backbone_id=config.backbone.id,
-        feature_meta={"feature_key": config.backbone.id, "dim": int(X.shape[1])},
+        feature_meta=load_feature_meta(config),
         label_snapshot=label_snapshot_sha(labels),
+        recipe=recipe,
     )
 
-    result = _evaluate_bundle(config, bundle)
+    result = _evaluate_bundle(config, bundle, manifest)
     if result is not None:
         bundle.test_metrics = {
             "accuracy": result.accuracy,
@@ -258,8 +260,9 @@ def run_train(config: Config) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = save(bundle, config.models_dir / f"probe_{stamp}.joblib")
 
+    class_counts = ", ".join(f"{name}={int((y == i).sum())}" for i, name in enumerate(config.classes))
     lines = [
-        f"- Training examples: **{bundle.n_train}**",
+        f"- Training examples: **{bundle.n_train}** ({class_counts}; class_weight=balanced)",
         f"- Best C: **{bundle.best_C}**",
         f"- CV balanced accuracy: **{bundle.cv_balanced_accuracy:.3f}**",
         f"- Label snapshot: `{bundle.label_snapshot_sha[:12]}`",

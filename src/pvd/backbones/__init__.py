@@ -21,6 +21,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str, str | None]] = {
 }
 
 FAKE_ID = "fake"
+FAKE_TEXT_ID = "fake_text"  # tests only: fake + deterministic text encoder
 
 
 @lru_cache(maxsize=None)
@@ -30,10 +31,14 @@ def build_backbone(backbone_id: str, device: str = "cpu") -> Backbone:
         from .fake_backbone import FakeBackbone
 
         return FakeBackbone().to(device)
+    if backbone_id == FAKE_TEXT_ID:
+        from .fake_backbone import FakeTextBackbone
+
+        return FakeTextBackbone().to(device)
 
     if backbone_id not in MODEL_REGISTRY:
         raise ValueError(
-            f"Unknown backbone {backbone_id!r}. Known: {sorted(MODEL_REGISTRY) + [FAKE_ID]}"
+            f"Unknown backbone {backbone_id!r}. Known: {sorted(MODEL_REGISTRY) + [FAKE_ID, FAKE_TEXT_ID]}"
         )
 
     family, model_name, pretrained = MODEL_REGISTRY[backbone_id]

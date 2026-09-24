@@ -89,11 +89,14 @@ def _cfg(ctx: typer.Context) -> Config:
 # Data preparation
 # --------------------------------------------------------------------------- #
 @_command()
-def scan(ctx: typer.Context) -> None:
+def scan(
+    ctx: typer.Context,
+    full: bool = typer.Option(False, "--full", help="Re-hash and re-decode every file, even unchanged ones."),
+) -> None:
     """Build/refresh the image manifest and report broken files and duplicates."""
     from .scan import run_scan
 
-    run_scan(_cfg(ctx))
+    run_scan(_cfg(ctx), full=full)
 
 
 @_command()

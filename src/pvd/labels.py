@@ -28,7 +28,8 @@ VALID_SAMPLED_AS = {"uncertain", "random", "audit", None}
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    """UTC timestamp in the ``2026-09-24T21:14:03Z`` form used by the spec (§8.3)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @dataclass
@@ -112,10 +113,25 @@ class LabelStore:
         return f"b{(max(numbers) + 1) if numbers else 1:04d}"
 
     # -- writes -------------------------------------------------------------
+    def _needs_leading_newline(self) -> bool:
+        """True if the log's last byte is not a newline.
+
+        That happens after a crash mid-write (a torn last line) or a manual edit
+        in an editor that drops the final newline. Appending straight after it
+        would glue the new event onto the broken line, and both would then be
+        skipped as malformed on the next load.
+        """
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return False
+        with open(self.path, "rb") as handle:
+            handle.seek(-1, os.SEEK_END)
+            return handle.read(1) != b"\n"
+
     def _append(self, event: LabelEvent) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        prefix = "\n" if self._needs_leading_newline() else ""
         with open(self.path, "a", encoding="utf-8") as handle:
-            handle.write(event.to_json() + "\n")
+            handle.write(prefix + event.to_json() + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         self._events.append(event)
@@ -132,8 +148,20 @@ class LabelStore:
             self._append(event)
         return batch_id
 
-    def undo_last(self) -> str | None:
-        """Revert the most recent non-undone batch; return its id (or None)."""
+    def undo_last(self, max_depth: int | None = None) -> str | None:
+        """Revert the most recent non-undone batch; return its id (or None).
+
+        ``max_depth`` (``review.undo_depth``) caps how many batches can be undone
+        in a row, so a stuck key cannot silently unwind a whole session.
+        """
+        if max_depth is not None:
+            trailing_undos = 0
+            for event in reversed(self._events):
+                if event.source != "undo":
+                    break
+                trailing_undos += 1
+            if trailing_undos >= max_depth:
+                return None
         undone = self._undone_batches()
         last_batch: str | None = None
         for event in self._events:
@@ -151,38 +179,50 @@ class LabelStore:
 # --------------------------------------------------------------------------- #
 # Effective training labels
 # --------------------------------------------------------------------------- #
-def effective_labels(config: Config, manifest: pd.DataFrame) -> pd.DataFrame:
+def effective_labels(
+    config: Config, manifest: pd.DataFrame, store: "LabelStore | None" = None
+) -> pd.DataFrame:
     """Return ``path, sha1, label`` rows safe to train on.
 
     Combines seed-folder labels with log overrides (``review``/``audit_fix``),
     drops ``skip`` and excluded statuses, and hard-excludes the test split so a
-    test image can never leak into training (G11).
+    test image can never leak into training (G11). Pass the live ``store`` to
+    avoid re-reading the log (the review app does this on every batch).
     """
-    store = LabelStore(config.labels_file)
+    store = store if store is not None else LabelStore(config.labels_file)
     overrides = store.current()
-
-    rows: list[dict] = []
-    for _, row in manifest.iterrows():
-        if row["status"] != "ok":
-            continue
-        sha = row["sha1"]
-        if sha in overrides:
-            label = overrides[sha]
-        elif row["split"] == "seed":
-            label = row["folder_label"]
-        else:
-            # Pool images only enter training once a human labels them.
-            continue
-        if label is None or label == config.skip_label:
-            continue
-        if label not in config.classes:
-            continue
-        if row["split"] == "test":
-            continue
-        rows.append({"path": row["path"], "sha1": sha, "label": label})
-
-    frame = pd.DataFrame(rows, columns=["path", "sha1", "label"])
     test_shas = set(manifest.loc[manifest["split"] == "test", "sha1"])
+
+    # A logged label can point at a test image, e.g. after a reviewed pool image
+    # was later copied into data/test/ (dedupe then keeps the test copy). The
+    # test split must win, so those labels are ignored, loudly.
+    shadowed = set(overrides) & test_shas
+    if shadowed:
+        log.warning(
+            "%d labeled image(s) are now in the test split; their logged labels "
+            "are ignored for training (test data is never trained on).",
+            len(shadowed),
+        )
+
+    known = set(config.classes) | {config.skip_label}
+    unknown = {label for label in overrides.values() if label not in known}
+    if unknown:
+        log.warning(
+            "Label log contains labels that are not current classes: %s. Those "
+            "images are not trained on and return to review.",
+            sorted(unknown),
+        )
+
+    ok = manifest[(manifest["status"] == "ok") & (manifest["split"] != "test")]
+    logged = ok["sha1"].map(overrides)
+    seed_label = ok["folder_label"].where(ok["split"] == "seed")
+    # A human decision (review/audit_fix) wins over the seed folder.
+    label = logged.where(logged.notna(), seed_label)
+    keep = label.isin(config.classes)
+    frame = pd.DataFrame(
+        {"path": ok.loc[keep, "path"], "sha1": ok.loc[keep, "sha1"], "label": label[keep]}
+    ).reset_index(drop=True)
+
     leaked = set(frame["sha1"]) & test_shas
     if leaked:
         raise RuntimeError(

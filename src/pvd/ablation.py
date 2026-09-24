@@ -15,8 +15,8 @@ import numpy as np
 import torch
 
 from .config import Config
-from .evaluate import evaluate_arrays, resolve_test_set, write_report
-from .features import get_features
+from .evaluate import evaluate_bundle, resolve_test_set, write_report
+from .features import feature_recipe, get_features
 from .labels import effective_labels
 from .probe import train_probe
 from .scan import load_manifest
@@ -76,10 +76,17 @@ def _run_spec(config: Config, spec: AblationSpec, labels, test) -> dict:
     class_to_index = {name: i for i, name in enumerate(cfg.classes)}
     train_shas = labels["sha1"].tolist()
     train_paths = [str(cfg.resolve(p)) for p in labels["path"].tolist()]
-    X = get_features(cfg, train_shas, train_paths, backbone_id=spec.backbone)
+    X, valid = get_features(cfg, train_shas, train_paths, backbone_id=spec.backbone, return_mask=True)
+    X, labels = X[valid], labels[valid].reset_index(drop=True)
+    train_paths = [p for p, ok in zip(train_paths, valid) if ok]
     y = np.array([class_to_index[label] for label in labels["label"]], dtype=int)
     bundle = train_probe(
-        X, y, cfg, classes=list(cfg.classes), backbone_id=spec.backbone
+        X,
+        y,
+        cfg,
+        classes=list(cfg.classes),
+        backbone_id=spec.backbone,
+        recipe=feature_recipe(spec.backbone, cfg),
     )
 
     row = {
@@ -92,9 +99,7 @@ def _run_spec(config: Config, spec: AblationSpec, labels, test) -> dict:
         "error": None,
     }
     if test is not None:
-        X_test = get_features(cfg, test.shas, test.paths, backbone_id=spec.backbone)
-        probs = bundle.estimator.predict_proba(X_test)
-        result = evaluate_arrays(test.y_true, probs, bundle.classes, test.frame, test.tags)
+        result = evaluate_bundle(cfg, bundle, test)
         row["test_balanced_accuracy"] = result.balanced_accuracy
         row["realistic_drawing"] = result.per_tag.get("realistic_drawing", {}).get("accuracy")
         row["filtered_photo"] = result.per_tag.get("filtered_photo", {}).get("accuracy")
@@ -173,7 +178,12 @@ def run_ablation(config: Config, specs: list[AblationSpec] | None = None) -> Pat
 
     specs = specs or default_specs(config)
     rows = []
+    from .backbones import build_backbone
+
     for spec in specs:
+        # Free the previous backbone: the registry cache would otherwise keep
+        # every model of the grid in memory at once.
+        build_backbone.cache_clear()
         log.info("Ablating %s", spec.name)
         try:
             rows.append(_run_spec(config, spec, labels, test))

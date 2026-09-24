@@ -59,4 +59,24 @@ class FakeBackbone:
         return None
 
     def meta(self) -> dict:
+        """Serializable identity stored in the embedding cache."""
         return {"backbone": self.id, "dim": self.dim}
+
+
+class FakeTextBackbone(FakeBackbone):
+    """``fake`` plus a deterministic text encoder, so zero-shot code paths can
+    be tested without downloading CLIP. Prompts map to seeded random unit
+    vectors (a hash of the text picks the seed); tests only.
+    """
+
+    id = "fake_text"
+    is_text_aligned = True
+    logit_scale = 100.0
+
+    def encode_text(self, prompts: list[str]) -> torch.Tensor:
+        rows = []
+        for prompt in prompts:
+            seed = sum(ord(ch) * (i + 1) for i, ch in enumerate(prompt)) % (2**31)
+            generator = torch.Generator().manual_seed(seed)
+            rows.append(torch.randn(self.dim, generator=generator))
+        return l2_normalize(torch.stack(rows))

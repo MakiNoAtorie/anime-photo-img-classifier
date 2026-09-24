@@ -20,18 +20,27 @@ import numpy as np
 from .config import Config
 from .device import pick_device
 from .evaluate import evaluate_arrays, render_report, resolve_test_set, write_report
-from .features import get_features
+from .features import get_features, global_block, load_feature_meta
 
 log = logging.getLogger(__name__)
 
 
+def missing_prompts(prompts_by_class: dict[str, list[str]], classes: list[str]) -> list[str]:
+    """Classes that have no zero-shot prompt (zero-shot needs one per class)."""
+    return [name for name in classes if not prompts_by_class.get(name)]
+
+
 def class_text_centroids(backbone, prompts_by_class: dict[str, list[str]], classes: list[str]) -> np.ndarray:
     """Average each class's prompt embeddings into an L2-normalized centroid."""
+    missing = missing_prompts(prompts_by_class, classes)
+    if missing:
+        raise ValueError(
+            f"No zero-shot prompts configured for {missing}. Add them under "
+            "zeroshot.prompts in config.yaml, or label examples of those classes."
+        )
     rows = []
     for name in classes:
-        prompts = prompts_by_class.get(name)
-        if not prompts:
-            raise ValueError(f"No zero-shot prompts configured for class {name!r}")
+        prompts = prompts_by_class[name]
         embeddings = backbone.encode_text(list(prompts))
         if embeddings is None:
             raise ValueError(
@@ -46,6 +55,7 @@ def class_text_centroids(backbone, prompts_by_class: dict[str, list[str]], class
 
 
 def softmax(logits: np.ndarray) -> np.ndarray:
+    """Numerically stable row-wise softmax."""
     shifted = logits - logits.max(axis=1, keepdims=True)
     exp = np.exp(shifted)
     return exp / exp.sum(axis=1, keepdims=True)
@@ -57,7 +67,11 @@ def zeroshot_probs(
     prompts_by_class: dict[str, list[str]],
     classes: list[str],
 ) -> np.ndarray:
-    """Return ``(N, C)`` probabilities from prompt-centroid similarity."""
+    """Return ``(N, C)`` probabilities from prompt-centroid similarity.
+
+    ``features`` must be the **global** block only (see
+    :func:`pvd.features.global_block`); tile/extra blocks are not text-aligned.
+    """
     centroids = class_text_centroids(backbone, prompts_by_class, classes)
     scale = getattr(backbone, "logit_scale", None) or 100.0
     logits = (features @ centroids.T) * scale
@@ -79,7 +93,10 @@ def run_zeroshot(config: Config) -> Path:
             "cannot run. Choose a CLIP/SigLIP backbone or use `pvd train` with seeds."
         )
 
-    features = get_features(config, test.shas, test.paths)
+    features, valid = get_features(config, test.shas, test.paths, return_mask=True)
+    if not valid.all():
+        test, features = test.subset(valid), features[valid]
+    features = global_block(features, load_feature_meta(config))
     probs = zeroshot_probs(backbone, features, config.zeroshot.prompts, config.classes)
 
     result = evaluate_arrays(test.y_true, probs, list(config.classes), test.frame, test.tags)

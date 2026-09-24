@@ -23,12 +23,17 @@ from sklearn.metrics import (
 )
 
 from .config import Config
-from .features import get_features
 from .scan import load_manifest
 
 log = logging.getLogger(__name__)
 
-RESOLUTION_BUCKETS = [(0, 512, "<512"), (512, 1024, "512-1024"), (1024, 2048, "1024-2048"), (2048, 10**9, ">2048")]
+# Long-side buckets, half-open so every size lands in exactly one bucket.
+RESOLUTION_BUCKETS = [
+    (0, 512, "<512"),
+    (512, 1024, "512-1023"),
+    (1024, 2048, "1024-2047"),
+    (2048, 10**9, ">=2048"),
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -36,16 +41,34 @@ RESOLUTION_BUCKETS = [(0, 512, "<512"), (512, 1024, "512-1024"), (1024, 2048, "1
 # --------------------------------------------------------------------------- #
 @dataclass
 class TestSet:
+    """The held-out split, aligned row by row: frame, sha1s, paths, labels, tags."""
+
     frame: pd.DataFrame
     shas: list[str]
     paths: list[str]
     y_true: np.ndarray
     tags: list[str | None]
 
+    def subset(self, mask: np.ndarray) -> "TestSet":
+        """Keep only rows where ``mask`` is True (e.g. images that embedded)."""
+        mask = np.asarray(mask, dtype=bool)
+        index = np.flatnonzero(mask)
+        return TestSet(
+            frame=self.frame.iloc[index].reset_index(drop=True),
+            shas=[self.shas[i] for i in index],
+            paths=[self.paths[i] for i in index],
+            y_true=self.y_true[index],
+            tags=[self.tags[i] for i in index],
+        )
 
-def resolve_test_set(config: Config) -> TestSet:
-    """Return the test split with integer labels, or raise a clear error."""
-    manifest = load_manifest(config)
+
+def resolve_test_set(config: Config, manifest: pd.DataFrame | None = None) -> TestSet:
+    """Return the test split with integer labels, or raise a clear error.
+
+    Pass an already-loaded ``manifest`` to avoid re-reading it from disk (the
+    review app evaluates after every batch).
+    """
+    manifest = manifest if manifest is not None else load_manifest(config)
     test = manifest[(manifest["split"] == "test") & (manifest["status"] == "ok")].copy()
     if test.empty:
         raise ValueError(
@@ -115,7 +138,11 @@ def _auc(y_true: np.ndarray, probs: np.ndarray, n_classes: int) -> float | None:
     try:
         if n_classes == 2:
             return float(roc_auc_score(y_true, probs[:, 1]))
-        return float(roc_auc_score(y_true, probs, multi_class="ovr", average="macro"))
+        return float(
+            roc_auc_score(
+                y_true, probs, multi_class="ovr", average="macro", labels=list(range(n_classes))
+            )
+        )
     except Exception:  # noqa: BLE001 - too few samples per class, etc.
         return None
 
@@ -246,6 +273,7 @@ def _pct(value: float) -> str:
 
 
 def render_report(name: str, result: EvalResult, extra_lines: list[str] | None = None) -> str:
+    """Render an :class:`EvalResult` as the standard Markdown evaluation report."""
     lines: list[str] = []
     lines.append(f"# Evaluation report: {name}")
     lines.append("")
@@ -330,6 +358,7 @@ def render_report(name: str, result: EvalResult, extra_lines: list[str] | None =
 
 
 def write_report(config: Config, kind: str, markdown: str) -> Path:
+    """Save a Markdown report as ``reports/<UTC timestamp>_<kind>.md``."""
     config.reports_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = config.reports_dir / f"{stamp}_{kind}.md"
@@ -341,19 +370,34 @@ def write_report(config: Config, kind: str, markdown: str) -> Path:
 # --------------------------------------------------------------------------- #
 # Trained model evaluation
 # --------------------------------------------------------------------------- #
+def evaluate_bundle(config: Config, bundle, test: TestSet | None = None) -> EvalResult:
+    """Score a probe or fine-tuned bundle on the test set, in config class order.
+
+    Images that cannot be embedded/decoded are dropped (and counted) rather
+    than scored as zero vectors; probability columns are matched to the config
+    classes by name, so a bundle trained before the classes were reordered is
+    still scored correctly.
+    """
+    from .models import align_probs, predict_proba_paths
+
+    test = test if test is not None else resolve_test_set(config)
+    probs, valid = predict_proba_paths(bundle, test.paths, config, shas=test.shas)
+    if not valid.all():
+        log.warning("Evaluating without %d test image(s) that could not be embedded.", int((~valid).sum()))
+        test, probs = test.subset(valid), probs[valid]
+    if not len(test.shas):
+        raise ValueError("No test image could be embedded; nothing to evaluate.")
+    probs = align_probs(probs, list(bundle.classes), list(config.classes))
+    return evaluate_arrays(test.y_true, probs, list(config.classes), test.frame, test.tags)
+
+
 def run_eval(config: Config, model: str | Path | None = None) -> Path:
     """Evaluate the newest (or given) bundle on the held-out test set."""
-    from .models import load_any, load_latest_any, predict_proba_paths
+    from .models import load_any, load_latest_any
 
     path = Path(model) if model else load_latest_any(config)
     bundle = load_any(path)
-    if set(bundle.classes) != set(config.classes):
-        raise ValueError(
-            f"Model classes {bundle.classes} != config classes {config.classes}."
-        )
-    test = resolve_test_set(config)
-    probs = predict_proba_paths(bundle, test.paths, config, shas=test.shas)
-    result = evaluate_arrays(test.y_true, probs, bundle.classes, test.frame, test.tags)
+    result = evaluate_bundle(config, bundle)
     extra = [
         f"Model: `{path.name}`",
         f"Kind: `{getattr(bundle, 'kind', 'probe')}`",

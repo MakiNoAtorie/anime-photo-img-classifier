@@ -42,6 +42,8 @@ def next_batch(
 
     ``probs`` and ``features`` are indexed by the caller's global index space;
     ``candidate_indices`` lists which of those rows are still unlabeled.
+    ``features`` should be the unit-norm global block: the diversity filter
+    compares dot products against a cosine threshold.
     """
     batch_size = min(config.review.batch_size, len(candidate_indices))
     if batch_size == 0:
@@ -56,20 +58,28 @@ def next_batch(
     order = np.argsort(margins, kind="stable")
     ranked = [candidates[i] for i in order]
 
+    use_diversity = config.review.diversity and features is not None and features.size > 0
+
     selected: list[int] = []
+    picked_unit: list[np.ndarray] = []  # unit vectors of the picks, normalized lazily
     for index in ranked:
         if len(selected) >= n_uncertain:
             break
-        if config.review.diversity and features is not None and selected:
-            similarity = features[selected] @ features[index]
-            if float(np.max(similarity)) > DIVERSITY_COSINE:
+        if use_diversity:
+            vector = features[index] / max(float(np.linalg.norm(features[index])), 1e-12)
+            if picked_unit and float(np.max(np.stack(picked_unit) @ vector)) > DIVERSITY_COSINE:
                 continue
+            picked_unit.append(vector)
         selected.append(index)
 
     uncertain = [(index, "uncertain") for index in selected]
 
-    remaining = [index for index in candidates if index not in set(selected)]
+    chosen = set(selected)
+    remaining = [index for index in candidates if index not in chosen]
     rng.shuffle(remaining)
+    # If the diversity filter left the uncertain slice short (many near-
+    # duplicates), top up with random picks so the batch keeps its size.
+    n_random += n_uncertain - len(selected)
     random_picks = [(index, "random") for index in remaining[:n_random]]
 
     batch = uncertain + random_picks

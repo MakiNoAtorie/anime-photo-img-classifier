@@ -44,7 +44,8 @@ def test_finetune_trains_saves_and_predicts(tmp_project: Config) -> None:
     assert tmp_project.resolve(bundle.checkpoint).exists()
 
     paths = [str(p) for p in tmp_project.test_dir.rglob("*.png")]
-    probs = finetune_predict_proba(bundle, paths, tmp_project)
+    probs, valid = finetune_predict_proba(bundle, paths, tmp_project)
+    assert valid.all()
     assert probs.shape == (len(paths), 2)
     assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-5)
 

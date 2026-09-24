@@ -8,6 +8,7 @@ defaults, so ``config.yaml`` can be minimal.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Literal
 
@@ -46,7 +47,14 @@ DEFAULT_EXTENSIONS: list[str] = [
     ".gif",
     ".tif",
     ".tiff",
+    # iPhone photos; decoded only if the optional `heic` extra is installed,
+    # otherwise scan reports them as broken instead of silently skipping them.
+    ".heic",
+    ".heif",
 ]
+
+# Folder names `pvd predict` writes next to the class folders.
+RESERVED_NAMES = {"unsure", "broken"}
 
 
 class PathsConfig(BaseModel):
@@ -73,7 +81,9 @@ class ImageConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     alpha_background: tuple[int, int, int] = (255, 255, 255)
-    max_pixels: int = 80_000_000
+    # Checked from the header before decoding; must be > 0 (0 would disable the
+    # decompression-bomb guard).
+    max_pixels: int = Field(default=80_000_000, gt=0, le=400_000_000)
     extensions: list[str] = Field(default_factory=lambda: list(DEFAULT_EXTENSIONS))
 
     @field_validator("extensions")
@@ -142,6 +152,9 @@ class ReviewConfig(BaseModel):
     diversity: bool = True
     undo_depth: int = Field(default=20, ge=0)
     retrain_every_batch: bool = True
+    # Full cross-validated retrain every N confirmed batches; in between, the
+    # probe is refit with the last chosen C (fast, NF2).
+    cv_every: int = Field(default=10, ge=1)
 
 
 class PredictConfig(BaseModel):
@@ -158,7 +171,7 @@ class FinetuneConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    model_name: str = "convnext_tiny"
+    model_name: str = "convnext_tiny.fb_in22k_ft_in1k"
     pretrained: bool = True
     image_size: int = Field(default=384, ge=32)
     epochs: int = Field(default=8, ge=1)
@@ -181,7 +194,7 @@ class Config(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    project_root: Path = Path(".")
+    project_root: Path = Field(default=Path("."), validate_default=True)
     classes: list[str] = Field(default_factory=lambda: ["photo", "drawing"])
     skip_label: str = "skip"
 
@@ -200,6 +213,19 @@ class Config(BaseModel):
     seed: int = 1234
 
     # -- validation ---------------------------------------------------------
+    @field_validator("project_root")
+    @classmethod
+    def _absolute_root(cls, value: Path) -> Path:
+        """Store the root as an absolute path.
+
+        Every relative path in the manifest, label log and reports is computed
+        against this root, so it must never stay as a bare ``.``: an absolute
+        file path is not "inside" the relative path ``.`` and comparisons fail.
+        ``abspath`` (not ``resolve``) is used so symlinked data folders keep
+        their in-project names.
+        """
+        return Path(os.path.abspath(value))
+
     @field_validator("classes")
     @classmethod
     def _validate_classes(cls, value: list[str]) -> list[str]:
@@ -211,8 +237,29 @@ class Config(BaseModel):
             raise ValueError(f"duplicate class names: {value}")
         return value
 
+    @model_validator(mode="before")
+    @classmethod
+    def _default_prompts_follow_classes(cls, data: Any) -> Any:
+        """Use built-in prompts only for configured classes that have them.
+
+        Without this, renaming the classes (e.g. ``[real, anime]``) would fail
+        validation because the built-in prompts name ``photo``/``drawing``.
+        Prompts written explicitly in config.yaml are still validated strictly.
+        """
+        if not isinstance(data, dict):
+            return data
+        zeroshot = data.get("zeroshot") or {}
+        if isinstance(zeroshot, dict) and "prompts" in zeroshot:
+            return data
+        classes = data.get("classes") or ["photo", "drawing"]
+        prompts = {name: list(DEFAULT_PROMPTS[name]) for name in classes if name in DEFAULT_PROMPTS}
+        return {**data, "zeroshot": {**zeroshot, "prompts": prompts}}
+
     @model_validator(mode="after")
     def _validate_cross_fields(self) -> "Config":
+        reserved = RESERVED_NAMES & set(self.classes)
+        if reserved:
+            raise ValueError(f"class names {sorted(reserved)} are reserved for `pvd predict` folders")
         if self.skip_label in self.classes:
             raise ValueError(
                 f"skip_label {self.skip_label!r} must not also be a class; "
@@ -236,7 +283,19 @@ class Config(BaseModel):
         path = Path(relative)
         if path.is_absolute():
             return path
-        return (self.project_root / path).resolve()
+        return Path(os.path.abspath(self.project_root / path))
+
+    def relative(self, path: str | Path) -> str:
+        """Return ``path`` as a project-relative POSIX string (G7).
+
+        Paths outside the project (e.g. a data folder on another drive) cannot
+        be made relative; they are kept absolute rather than crashing.
+        """
+        absolute = Path(os.path.abspath(path))
+        try:
+            return absolute.relative_to(self.project_root).as_posix()
+        except ValueError:
+            return absolute.as_posix()
 
     @property
     def pool_dir(self) -> Path:
@@ -295,6 +354,11 @@ def load_config(path: str | Path = "config.yaml") -> Config:
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"{config_path} must contain a YAML mapping at the top level")
+    # A relative project_root means "relative to this config file", so
+    # `pvd -c some/dir/config.yaml` works from any working directory.
+    root = Path(raw.get("project_root", "."))
+    if not root.is_absolute():
+        raw["project_root"] = config_path.parent.absolute() / root
     return Config.model_validate(raw)
 
 
@@ -302,7 +366,10 @@ def write_default_config(path: str | Path) -> None:
     """Write the built-in defaults to ``path`` (used by docs/onboarding)."""
     config_path = Path(path)
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    defaults = Config().to_dict()
+    # Keep the written file portable: "." means "the folder holding this file".
+    defaults["project_root"] = "."
     config_path.write_text(
-        yaml.safe_dump(Config().to_dict(), sort_keys=False),
+        yaml.safe_dump(defaults, sort_keys=False),
         encoding="utf-8",
     )

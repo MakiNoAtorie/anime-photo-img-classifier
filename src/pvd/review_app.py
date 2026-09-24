@@ -2,14 +2,26 @@
 
 The interactive behaviour lives in :class:`ReviewSession`, a plain Python object
 with no Gradio dependency. That keeps the state machine unit-testable (select,
-set label, confirm, undo) without a browser, and makes the Gradio code a thin
-view layer.
+set label, cycle, confirm, undo, modes) without a browser, and makes the Gradio
+code a thin view layer.
 
 Design rules implemented here:
 - clicking a thumbnail only *selects* it; it never changes a label (G18),
 - labels are set with one button per class plus ``skip``, so any N works (G20),
-- confirming records unchanged images as "model was right",
-- confirming retrains on cached embeddings and resamples in a few seconds (NF2).
+- in active/random mode, confirming records unchanged images as "model was
+  right"; in audit mode, unchanged images keep their **stored** label (only
+  explicit corrections are written as ``audit_fix``),
+- confirming refits the probe on cached embeddings with the last chosen ``C``
+  and resamples in a few seconds (NF2); a full cross-validated retrain runs
+  every ``review.cv_every`` batches,
+- until every class has ``MIN_TRAIN_PER_CLASS`` labels the app uses zero-shot
+  (or no model) and says why.
+
+Single-user by assumption: one session object per process (§10.3).
+
+Note: this module intentionally does **not** use ``from __future__ import
+annotations``. Gradio inspects the ``gr.SelectData`` type hint at runtime to
+decide whether to pass the click event; a string annotation would hide it.
 """
 
 import logging
@@ -21,16 +33,17 @@ import pandas as pd
 
 from .config import Config
 from .evaluate import evaluate_arrays, resolve_test_set
-from .features import get_features, load_embedding_cache
+from .features import get_features, global_block, load_feature_meta
 from .imageio import load_rgb
 from .labels import LabelEvent, LabelStore, effective_labels
-from .probe import train_probe
+from .probe import MIN_TRAIN_PER_CLASS, quick_retrain, train_probe
 from .sampler import next_batch
 from .scan import load_manifest
 
 log = logging.getLogger(__name__)
 
 THUMBNAIL_SIZE = 384
+MODES = ("active", "random", "audit")
 
 
 # --------------------------------------------------------------------------- #
@@ -38,23 +51,38 @@ THUMBNAIL_SIZE = 384
 # --------------------------------------------------------------------------- #
 @dataclass
 class SessionItem:
+    """One image in the current batch."""
+
     sha1: str
     path_rel: str
     path_abs: str
     sampled_as: str
     model_pred: str
     model_conf: float
+    #: Label saved if the reviewer does not touch the item: the model's guess in
+    #: active/random mode, the stored label in audit mode.
+    default_label: str
+    #: The label this image already has (seed folder or log), if any.
+    stored_label: str | None = None
 
 
 def make_thumbnail(config: Config, sha1: str, source: Path) -> Path:
-    """Create (once) and return a cached 384px JPEG thumbnail (G18, note 9)."""
+    """Create (once) and return a cached 384px JPEG thumbnail (G18, note 9).
+
+    Falls back to the original file if it cannot be decoded, so one bad file
+    never breaks the gallery.
+    """
     target = config.thumbs_dir / f"{sha1}.jpg"
     if target.exists():
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
-    image = load_rgb(source, tuple(config.image.alpha_background), config.image.max_pixels)
-    image.thumbnail((THUMBNAIL_SIZE, THUMBNAIL_SIZE))
-    image.convert("RGB").save(target, format="JPEG", quality=85)
+    try:
+        image = load_rgb(source, tuple(config.image.alpha_background), config.image.max_pixels)
+        image.thumbnail((THUMBNAIL_SIZE, THUMBNAIL_SIZE))
+        image.convert("RGB").save(target, format="JPEG", quality=85)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Thumbnail failed for %s: %s", source, exc)
+        return source
     return target
 
 
@@ -68,85 +96,109 @@ class ReviewSession:
         self.store = LabelStore(config.labels_file)
         self.class_to_index = {name: i for i, name in enumerate(config.classes)}
 
-        self.ok = self.manifest[self.manifest["status"] == "ok"].reset_index(drop=True)
+        ok = self.manifest[self.manifest["status"] == "ok"].reset_index(drop=True)
+        self.features, self.ok = self._load_features(ok)
         self.sha_to_pos = {sha: pos for pos, sha in enumerate(self.ok["sha1"])}
-        self.features = self._load_features()
+        self.meta = load_feature_meta(config)
+        # Unit-norm, text-aligned block: used for zero-shot and similarity.
+        self.global_features = global_block(self.features, self.meta) if self.features.size else self.features
         self._backbone = None
-        self.backbone_dim = self._global_dim()
+        self._centroids: np.ndarray | None = None
 
         self.model = None
-        self.best_C = 10.0
+        self.best_C: float | None = None
         self.model_kind = "none"
+        self.model_reason = ""
+        self.batches_since_cv = 0
         self.cv_balanced_accuracy: float | None = None
         self.last_test_ba: float | None = None
         self.delta_test_ba: float | None = None
         self.last_batch_summary: dict | None = None
+        self.last_action = ""
 
+        self.mode = "active"
         self.batch: list[SessionItem] = []
         self.pending: dict[int, str] = {}
         self.selected: int | None = None
-        self._fit_model()
+        self._fit_model(full_cv=True)
         self._recompute_scores()
+        self.last_test_ba = self.evaluate_test()
         self.next_batch()
 
     # -- features / model ---------------------------------------------------
-    def _load_features(self) -> np.ndarray:
-        if self.ok.empty:
-            return np.zeros((0, 0), dtype=np.float32)
-        shas = self.ok["sha1"].tolist()
-        paths = [str(self.config.resolve(p)) for p in self.ok["path"].tolist()]
-        return get_features(self.config, shas, paths)
+    def _load_features(self, ok: pd.DataFrame) -> tuple[np.ndarray, pd.DataFrame]:
+        """Feature matrix for ``ok`` rows, dropping images that failed to embed."""
+        if ok.empty:
+            return np.zeros((0, 0), dtype=np.float32), ok
+        shas = ok["sha1"].tolist()
+        paths = [str(self.config.resolve(p)) for p in ok["path"].tolist()]
+        features, valid = get_features(self.config, shas, paths, return_mask=True)
+        if not valid.all():
+            ok = ok[valid].reset_index(drop=True)
+            features = features[valid]
+        return features, ok
 
-    def _global_dim(self) -> int:
-        key = self.config.backbone.id
-        try:
-            _, _, meta = load_embedding_cache(self.config, key)
-            return int(meta.get("block_sizes", {}).get("global", self.features.shape[1]))
-        except Exception:  # noqa: BLE001
-            return self.features.shape[1]
+    def _labels(self) -> pd.DataFrame:
+        return effective_labels(self.config, self.manifest, self.store)
 
     def _training_rows(self) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-        labels = effective_labels(self.config, self.manifest)
-        positions, targets = [], []
-        for _, row in labels.iterrows():
-            pos = self.sha_to_pos.get(row["sha1"])
-            if pos is None:
-                continue
-            positions.append(pos)
-            targets.append(self.class_to_index[row["label"]])
-        X = self.features[positions] if positions else np.zeros((0, self.features.shape[1]), np.float32)
-        y = np.array(targets, dtype=int)
+        labels = self._labels()
+        positions = labels["sha1"].map(self.sha_to_pos)
+        labels = labels[positions.notna()].reset_index(drop=True)
+        positions = positions.dropna().astype(int).to_numpy()
+        X = self.features[positions] if len(positions) else np.zeros((0, self.features.shape[1]), np.float32)
+        y = labels["label"].map(self.class_to_index).to_numpy(dtype=int)
         return X, y, labels
 
-    def _fit_model(self) -> None:
+    def _fit_model(self, full_cv: bool = False) -> None:
+        """Pick probe / zero-shot / none and (re)fit the probe.
+
+        The probe needs ``MIN_TRAIN_PER_CLASS`` labels in every class (§9.8).
+        Full cross-validation runs at startup and every ``review.cv_every``
+        batches; otherwise the probe is refit once with the last chosen ``C``.
+        """
         X, y, _ = self._training_rows()
-        counts = np.bincount(y, minlength=len(self.config.classes)) if len(y) else np.zeros(len(self.config.classes), int)
-        if len(y) and counts.min() >= 2:
-            bundle = train_probe(
-                X,
-                y,
-                self.config,
-                classes=list(self.config.classes),
-                backbone_id=self.config.backbone.id,
-            )
-            self.model = bundle.estimator
-            self.best_C = bundle.best_C or self.best_C
+        n_classes = len(self.config.classes)
+        counts = np.bincount(y, minlength=n_classes) if len(y) else np.zeros(n_classes, int)
+        if counts.min() >= MIN_TRAIN_PER_CLASS:
+            if full_cv or self.model is None or self.best_C is None:
+                bundle = train_probe(
+                    X, y, self.config, classes=list(self.config.classes), backbone_id=self.config.backbone.id
+                )
+                self.model = bundle.estimator
+                self.best_C = bundle.best_C
+                self.cv_balanced_accuracy = bundle.cv_balanced_accuracy
+                self.batches_since_cv = 0
+            else:
+                self.model = quick_retrain(X, y, self.best_C, self.config)
             self.model_kind = "probe"
-            self.cv_balanced_accuracy = bundle.cv_balanced_accuracy
-        elif self._has_text_backbone():
+            self.model_reason = f"linear probe on {len(y)} labels (C={self.best_C:g})"
+            return
+
+        self.model = None
+        have = ", ".join(f"{name}={int(n)}" for name, n in zip(self.config.classes, counts))
+        need = f"the probe needs {MIN_TRAIN_PER_CLASS} labels per class (have {have})"
+        text_ok, why_not = self._zeroshot_available()
+        if text_ok:
             self.model_kind = "zeroshot"
+            self.model_reason = f"zero-shot text prompts until {need}"
         else:
             self.model_kind = "none"
+            self.model_reason = f"no predictions yet: {why_not}, and {need}"
 
-    def _has_text_backbone(self) -> bool:
+    def _zeroshot_available(self) -> tuple[bool, str]:
+        from .zeroshot import missing_prompts
+
+        missing = missing_prompts(self.config.zeroshot.prompts, list(self.config.classes))
+        if missing:
+            return False, f"no zero-shot prompts for {missing}"
         try:
-            from .backbones import build_backbone
-            from .device import pick_device
-
-            backbone = build_backbone(self.config.backbone.id, pick_device(self.config.device))
-            return bool(getattr(backbone, "is_text_aligned", False))
-        except Exception:  # noqa: BLE001
-            return False
+            backbone = self._get_backbone()
+        except Exception as exc:  # noqa: BLE001
+            return False, f"backbone unavailable ({exc})"
+        if not getattr(backbone, "is_text_aligned", False):
+            return False, f"backbone {self.config.backbone.id!r} has no text encoder"
+        return True, ""
 
     def _get_backbone(self):
         if self._backbone is None:
@@ -168,154 +220,239 @@ class ReviewSession:
             from .zeroshot import class_text_centroids, softmax
 
             backbone = self._get_backbone()
-            global_features = self.features[:, : self.backbone_dim]
-            centroids = class_text_centroids(backbone, self.config.zeroshot.prompts, list(self.config.classes))
+            if self._centroids is None:
+                self._centroids = class_text_centroids(
+                    backbone, self.config.zeroshot.prompts, list(self.config.classes)
+                )
             scale = getattr(backbone, "logit_scale", None) or 100.0
-            self.probs = softmax((global_features @ centroids.T) * scale)
+            self.probs = softmax((self.global_features @ self._centroids.T) * scale)
         else:
             self.probs = np.full((n, n_classes), 1.0 / n_classes)
 
     # -- candidates / batches ----------------------------------------------
     def labeled_shas(self) -> set[str]:
-        return set(self.store.current())
+        """Pool images already decided (a class or skip) and so not candidates.
+
+        Labels for classes that no longer exist (after a rename) don't count,
+        so those images come back to review instead of vanishing.
+        """
+        valid = set(self.config.classes) | {self.config.skip_label}
+        return {sha for sha, label in self.store.current().items() if label in valid}
 
     def candidate_positions(self) -> list[int]:
-        labeled = self.labeled_shas()
         is_pool = (self.ok["split"] == "pool").to_numpy()
-        return [pos for pos in range(len(self.ok)) if is_pool[pos] and self.ok["sha1"][pos] not in labeled]
+        labeled = self.ok["sha1"].isin(self.labeled_shas()).to_numpy()
+        return np.flatnonzero(is_pool & ~labeled).tolist()
+
+    def set_mode(self, mode: str) -> list[SessionItem]:
+        """Switch between active learning, random sampling and audit batches."""
+        if mode not in MODES:
+            raise ValueError(f"Unknown mode {mode!r}; use one of {MODES}")
+        self.mode = mode
+        return self.next_batch()
 
     def next_batch(self) -> list[SessionItem]:
+        """Load the next batch for the current mode and clear pending edits."""
+        if self.mode == "audit":
+            return self.load_audit_batch()
         candidates = self.candidate_positions()
-        picks = next_batch(self.probs, candidates, self.features, self.config, self.rng)
-        self.batch = []
-        for pos, sampled_as in picks:
-            self.batch.append(self._make_item(pos, sampled_as))
+        if self.mode == "random":
+            size = min(self.config.review.batch_size, len(candidates))
+            chosen = self.rng.choice(candidates, size=size, replace=False) if size else []
+            picks = [(int(pos), "random") for pos in chosen]
+        else:
+            picks = next_batch(self.probs, candidates, self.global_features, self.config, self.rng)
+        self.batch = [self._make_item(pos, sampled_as) for pos, sampled_as in picks]
         self.pending = {}
+        self.selected = None
         return self.batch
 
     def load_audit_batch(self, limit: int | None = None) -> list[SessionItem]:
-        """Replace the batch with likely label mistakes for re-review (G21)."""
+        """Replace the batch with likely label mistakes for re-review (G21).
+
+        Unchanged audit items keep their stored label on confirm; only explicit
+        corrections are written (as ``audit_fix``).
+        """
         from .audit import label_error_suspects
 
-        suspects = label_error_suspects(self.config, self.manifest)
-        if limit is not None:
-            suspects = suspects[:limit]
+        self.mode = "audit"
+        limit = limit if limit is not None else self.config.review.batch_size
+        suspects = label_error_suspects(self.config, self.manifest, store=self.store)[:limit]
         self.batch = []
         for suspect in suspects:
             position = self.sha_to_pos.get(suspect["sha1"])
             if position is None:
                 continue
-            self.batch.append(self._make_item(position, "audit"))
+            self.batch.append(self._make_item(position, "audit", stored_label=suspect["label"]))
         self.pending = {}
+        self.selected = None
         return self.batch
 
-    def _make_item(self, pos: int, sampled_as: str) -> SessionItem:
+    def _stored_label(self, sha1: str, row: pd.Series) -> str | None:
+        logged = self.store.current().get(sha1)
+        if logged is not None:
+            return logged
+        return row["folder_label"] if row["split"] == "seed" else None
+
+    def _make_item(self, pos: int, sampled_as: str, stored_label: str | None = None) -> SessionItem:
         row = self.ok.iloc[pos]
         pred_index = int(self.probs[pos].argmax())
+        model_pred = self.config.classes[pred_index]
+        stored = stored_label if stored_label is not None else self._stored_label(row["sha1"], row)
         return SessionItem(
             sha1=row["sha1"],
             path_rel=row["path"],
             path_abs=str(self.config.resolve(row["path"])),
             sampled_as=sampled_as,
-            model_pred=self.config.classes[pred_index],
+            model_pred=model_pred,
             model_conf=float(self.probs[pos].max()),
+            default_label=(stored if sampled_as == "audit" and stored else model_pred),
+            stored_label=stored,
         )
 
+    # -- selection and labels ----------------------------------------------
     def select(self, position: int) -> SessionItem | None:
+        """Select an item for the preview. Never changes a label (G18)."""
         if 0 <= position < len(self.batch):
+            self.selected = position
             return self.batch[position]
         return None
+
+    def move_selection(self, step: int) -> int | None:
+        """Select the next/previous item (arrow keys), wrapping around."""
+        if not self.batch:
+            return None
+        start = -1 if self.selected is None and step > 0 else (self.selected or 0)
+        self.selected = (start + step) % len(self.batch)
+        return self.selected
 
     def set_label(self, position: int, label: str) -> None:
         if 0 <= position < len(self.batch):
             self.pending[position] = label
 
+    def label_cycle(self, position: int) -> list[str]:
+        """Quick-mode order: model guess -> other classes -> skip (G20)."""
+        pred = self.batch[position].model_pred
+        others = [name for name in self.config.classes if name != pred]
+        return [pred, *others, self.config.skip_label]
+
+    def cycle_label(self, position: int) -> str | None:
+        """Advance the item's label one step along :meth:`label_cycle`."""
+        if not 0 <= position < len(self.batch):
+            return None
+        cycle = self.label_cycle(position)
+        current = self.current_label(position)
+        next_label = cycle[(cycle.index(current) + 1) % len(cycle)] if current in cycle else cycle[0]
+        self.set_label(position, next_label)
+        return next_label
+
     def current_label(self, position: int) -> str | None:
         if position in self.pending:
             return self.pending[position]
-        return self.batch[position].model_pred
+        return self.batch[position].default_label
 
     def changed(self, position: int) -> bool:
-        return position in self.pending and self.pending[position] != self.batch[position].model_pred
+        return position in self.pending and self.pending[position] != self.batch[position].default_label
 
     def path_of(self, position: int) -> Path:
         return Path(self.batch[position].path_abs)
 
     # -- confirm / undo -----------------------------------------------------
     def confirm(self) -> dict:
+        """Write the batch's labels, retrain and load the next batch."""
         events: list[LabelEvent] = []
         wrong: list[bool] = []
         random_wrong: list[bool] = []
         for position, item in enumerate(self.batch):
             explicit = self.pending.get(position)
-            if explicit is None:
-                if self.model_kind == "none":
-                    continue  # no prediction to trust; leave unlabeled
-                final = item.model_pred
+            if item.sampled_as == "audit":
+                final = explicit if explicit is not None else item.default_label
+                if final == item.stored_label:
+                    continue  # confirmed as already labeled: nothing to write
+            elif explicit is None and self.model_kind == "none":
+                continue  # no prediction to trust; leave unlabeled
             else:
-                final = explicit
+                final = explicit if explicit is not None else item.default_label
             events.append(
                 LabelEvent(
                     sha1=item.sha1,
                     label=final,
                     path=item.path_rel,
-                    prev=None,
+                    prev=item.stored_label,
                     source="audit_fix" if item.sampled_as == "audit" else "review",
                     model_pred=item.model_pred,
                     model_conf=item.model_conf,
                     sampled_as=item.sampled_as,
                 )
             )
-            is_wrong = final != item.model_pred
-            wrong.append(is_wrong)
-            if item.sampled_as == "random":
-                random_wrong.append(is_wrong)
+            if item.sampled_as != "audit":
+                is_wrong = final != item.model_pred
+                wrong.append(is_wrong)
+                if item.sampled_as == "random":
+                    random_wrong.append(is_wrong)
 
         batch_id = self.store.add_batch(events) if events else None
-        changed = sum(1 for position in self.pending if self.changed(position))
         summary = {
             "batch_id": batch_id,
+            "mode": self.mode,
             "confirmed": len(events),
-            "changed": changed,
-            "batch_error_rate": float(np.mean(wrong)) if wrong else 0.0,
+            "shown": len(self.batch),
+            "changed": sum(1 for position in self.pending if self.changed(position)),
+            "batch_error_rate": float(np.mean(wrong)) if wrong else None,
             "random_error_rate": float(np.mean(random_wrong)) if random_wrong else None,
             "random_n": len(random_wrong),
+            "random_wrong": int(sum(random_wrong)),
         }
         self.last_batch_summary = summary
-        self._refresh_after_label_change()
+        self.last_action = (
+            f"Saved batch `{batch_id}` ({len(events)} labels)." if batch_id else "Nothing to save in this batch."
+        )
+        if batch_id:
+            self.batches_since_cv += 1
+        if self.mode == "audit":
+            self.mode = "active"  # an audit pass is one batch; resume active learning
+        if batch_id and self.config.review.retrain_every_batch:
+            self._refresh_after_label_change()
+        else:
+            self.next_batch()
         return summary
 
     def undo(self) -> str | None:
-        undone = self.store.undo_last()
-        if undone is not None:
-            self._refresh_after_label_change()
+        """Revert the last confirmed batch (up to ``review.undo_depth`` in a row)."""
+        undone = self.store.undo_last(max_depth=self.config.review.undo_depth)
+        if undone is None:
+            self.last_action = "Nothing to undo (or the undo limit was reached)."
+            return None
+        self.last_batch_summary = None
+        self.last_action = f"Undid batch `{undone}`; its images are back in the pool."
+        self._refresh_after_label_change()
         return undone
 
     def _refresh_after_label_change(self) -> None:
-        previous = self.last_test_ba
-        self._fit_model()
+        full_cv = self.batches_since_cv >= self.config.review.cv_every
+        self._fit_model(full_cv=full_cv)
         self._recompute_scores()
         current = self.evaluate_test()
+        if self.last_test_ba is not None and current is not None:
+            self.delta_test_ba = current - self.last_test_ba
+        else:
+            self.delta_test_ba = None
         self.last_test_ba = current
-        if previous is not None and current is not None:
-            self.delta_test_ba = current - previous
         self.next_batch()
 
     def evaluate_test(self) -> float | None:
         """Balanced accuracy on the held-out test set, or None if unavailable."""
         if self.model_kind != "probe":
             return None
-        test_mask = (self.ok["split"] == "test").to_numpy()
-        if not test_mask.any():
-            return None
         try:
-            test = resolve_test_set(self.config)
+            test = resolve_test_set(self.config, self.manifest)
         except ValueError:
             return None
-        positions = [self.sha_to_pos[sha] for sha in test.shas if sha in self.sha_to_pos]
-        if len(positions) != len(test.shas):
+        present = np.array([sha in self.sha_to_pos for sha in test.shas], dtype=bool)
+        if not present.any():
             return None
-        X = self.features[positions]
+        test = test.subset(present)
+        X = self.features[[self.sha_to_pos[sha] for sha in test.shas]]
         result = evaluate_arrays(
             test.y_true, self.model.predict_proba(X), list(self.config.classes), test.frame, test.tags
         )
@@ -323,54 +460,94 @@ class ReviewSession:
 
     # -- status / value helpers --------------------------------------------
     def labeled_counts(self) -> dict[str, int]:
-        counts = {name: 0 for name in self.config.classes}
-        for label in self.store.current().values():
-            if label in counts:
-                counts[label] += 1
-        return counts
+        """Training labels per class (seed folders + review/audit decisions)."""
+        counts = self._labels()["label"].value_counts()
+        return {name: int(counts.get(name, 0)) for name in self.config.classes}
 
     def batch_labels(self) -> list[str]:
         return [self.current_label(i) or "?" for i in range(len(self.batch))]
 
+    def unchanged_hint(self) -> str:
+        """What Confirm does with images the reviewer did not touch."""
+        if self.mode == "audit":
+            return "Audit: untouched images **keep their current label**; only your changes are saved."
+        if self.model_kind == "none":
+            return "No model yet: only images you label explicitly are saved."
+        return "⚠️ Untouched images are saved **as the model's guess** when you press Confirm — check each one."
+
     def status_markdown(self) -> str:
         counts = self.labeled_counts()
         count_text = ", ".join(f"{name}={counts[name]}" for name in self.config.classes)
-        ba = f"{self.last_test_ba * 100:.2f}%" if self.last_test_ba is not None else "n/a"
-        delta = ""
-        if self.delta_test_ba is not None:
-            delta = f" ({self.delta_test_ba * 100:+.2f})"
+        ba = f"{self.last_test_ba * 100:.1f}%" if self.last_test_ba is not None else "n/a"
+        delta = f" ({self.delta_test_ba * 100:+.1f} pp)" if self.delta_test_ba is not None else ""
         lines = [
-            f"**Batch {self.store.next_batch_id()}** · {len(self.batch)} shown · "
-            f"labeled: {count_text} · model: `{self.model_kind}`"
+            f"**Mode: {self.mode}** · batch {self.store.next_batch_id()} · {len(self.batch)} shown · "
+            f"training labels: {count_text}",
+            f"Model: {self.model_reason}",
+            f"Test balanced accuracy (the real progress meter): **{ba}{delta}**",
         ]
-        lines.append(f"Test balanced accuracy: **{ba}{delta}**")
-        if self.last_batch_summary:
-            s = self.last_batch_summary
+        s = self.last_batch_summary
+        if s and s.get("batch_error_rate") is not None:
             random_text = (
-                f"{s['random_error_rate'] * 100:.0f}% on {s['random_n']} random"
-                if s["random_error_rate"] is not None
+                f"random part: {s['random_wrong']}/{s['random_n']} wrong"
+                if s["random_n"]
                 else "no random items"
             )
             lines.append(
-                f"Last batch: changed {s['changed']}/{s['confirmed']} · "
-                f"error {s['batch_error_rate'] * 100:.0f}% overall, {random_text} "
-                "(the random slice is the unbiased one — hard/uncertain items are chosen on purpose)"
+                f"Last batch: changed {s['changed']}/{s['shown']} ({random_text}). "
+                "_Uncertain images are picked because they are hard, so the whole-batch "
+                "error stays high even as the model improves; the random part is the unbiased one._"
             )
+        if self.last_action:
+            lines.append(self.last_action)
         if not self.batch:
             lines.append("")
-            lines.append("**All pool images reviewed.** Run `pvd train` and `pvd eval` for the final report.")
+            lines.append(self._empty_message())
         return "\n\n".join(lines)
+
+    def _empty_message(self) -> str:
+        if self.mode == "audit":
+            return "**No likely label mistakes found.** Switch back to *active* mode."
+        if not (self.ok["split"] == "pool").any():
+            return (
+                "**No pool images found.** Put unlabeled images in `data/pool/`, then run "
+                "`pvd scan` and `pvd embed` and restart the app."
+            )
+        return "**All pool images reviewed.** Run `pvd train` and `pvd eval` for the final report."
 
 
 # --------------------------------------------------------------------------- #
 # Gradio view
 # --------------------------------------------------------------------------- #
+# Keyboard shortcuts: 1..9 label, 0/s skip, arrows move, Enter confirms. They
+# click the matching buttons, so the keyboard and mouse share one code path.
+KEYBOARD_JS = """
+<script>
+document.addEventListener('keydown', (event) => {
+  const target = event.target;
+  if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  let id = null;
+  if (/^[1-9]$/.test(event.key)) id = 'pvd-label-' + (parseInt(event.key, 10) - 1);
+  else if (event.key === '0' || event.key === 's') id = 'pvd-skip';
+  else if (event.key === 'ArrowRight') id = 'pvd-next';
+  else if (event.key === 'ArrowLeft') id = 'pvd-prev';
+  else if (event.key === 'Enter') id = 'pvd-confirm';
+  if (!id) return;
+  const element = document.getElementById(id);
+  if (element) { event.preventDefault(); element.click(); }
+});
+</script>
+"""
+
+
 def _contact_sheet(session: ReviewSession) -> list[tuple[str, str]]:
+    """Gallery items: thumbnail + caption ``label (model confidence)`` + ``*`` if changed."""
     items = []
     for position, item in enumerate(session.batch):
         thumb = make_thumbnail(session.config, item.sha1, Path(item.path_abs))
-        marker = " *" if session.changed(position) else ""
-        caption = f"{session.current_label(position)}{marker}"
+        marker = " ✱" if session.changed(position) else ""
+        caption = f"{session.current_label(position)}{marker} · {item.model_pred} {item.model_conf:.2f}"
         items.append((str(thumb), caption))
     return items
 
@@ -379,27 +556,44 @@ def build_app(session: ReviewSession):
     """Wire the session into a Gradio Blocks app (does not launch)."""
     import gradio as gr
 
-    # Quick mode is a tiny piece of view state; selection lives on the session.
     view_state = {"quick": False}
+    label_names = list(session.config.classes) + [session.config.skip_label]
 
-    def view(position: int | None):
-        gallery = _contact_sheet(session)
+    def detail_text(position: int | None) -> str:
         if position is None or not (0 <= position < len(session.batch)):
-            return gallery, None, "_Select an image to inspect it._", session.status_markdown()
+            return "_Click a thumbnail to inspect it at full resolution._"
         item = session.batch[position]
-        detail = (
-            f"**{Path(item.path_rel).name}**\n\n"
-            f"Model: `{item.model_pred}` ({item.model_conf:.2f}) · "
+        stored = f" · stored label: `{item.stored_label}`" if item.stored_label else ""
+        return (
+            f"**{Path(item.path_rel).name}** ({position + 1}/{len(session.batch)})\n\n"
+            f"Model: `{item.model_pred}` ({item.model_conf:.2f}){stored}\n\n"
             f"Current: `{session.current_label(position)}`"
             + (" **(changed)**" if session.changed(position) else "")
-            + f"\n\nSampled as: `{item.sampled_as}`"
+            + f" · sampled as `{item.sampled_as}`"
         )
-        return gallery, item.path_abs, detail, session.status_markdown()
 
-    with gr.Blocks(title="Photo vs Drawing review") as demo:
+    def view(position: int | None):
+        valid = position is not None and 0 <= position < len(session.batch)
+        current = session.current_label(position) if valid else None
+        buttons = [
+            gr.update(variant="primary" if name == current else "secondary") for name in label_names
+        ]
+        return (
+            gr.update(value=_contact_sheet(session), selected_index=position if valid else None),
+            session.batch[position].path_abs if valid else None,
+            detail_text(position),
+            session.status_markdown(),
+            session.unchanged_hint(),
+            gr.update(value=session.mode),
+            *buttons,
+        )
+
+    with gr.Blocks(title="Photo vs Drawing review", analytics_enabled=False) as demo:
         gr.Markdown("## Photo vs Drawing — review")
         status = gr.Markdown(session.status_markdown())
-        label_buttons: list[tuple[str, gr.Button]] = []
+        with gr.Row():
+            mode_radio = gr.Radio(list(MODES), value=session.mode, label="Mode", scale=2)
+            quick_toggle = gr.Checkbox(label="Quick mode (click cycles guess → others → skip)", value=False, scale=1)
 
         with gr.Row():
             with gr.Column(scale=3):
@@ -407,83 +601,98 @@ def build_app(session: ReviewSession):
                     value=_contact_sheet(session),
                     columns=6,
                     rows=4,
-                    height="auto",
+                    height=560,
+                    object_fit="contain",
                     allow_preview=False,
-                    label="Batch (click to select)",
+                    label="Batch (click to select; ✱ = changed)",
                 )
             with gr.Column(scale=2):
-                preview = gr.Image(label="Preview (full resolution)", type="filepath", height=420)
-                detail = gr.Markdown("_Select an image to inspect it._")
+                preview = gr.Image(
+                    label="Preview (full resolution)",
+                    type="filepath",
+                    height=560,
+                    buttons=["fullscreen"],
+                )
+                detail = gr.Markdown(detail_text(None))
+                label_buttons = []
                 with gr.Row():
-                    for label in list(session.config.classes) + [session.config.skip_label]:
-                        label_buttons.append((label, gr.Button(label)))
+                    for i, name in enumerate(label_names):
+                        is_skip = name == session.config.skip_label
+                        key = "0/s" if is_skip else str(i + 1)
+                        label_buttons.append(
+                            gr.Button(
+                                f"{name} [{key}]",
+                                variant="secondary",
+                                elem_id="pvd-skip" if is_skip else f"pvd-label-{i}",
+                            )
+                        )
+                with gr.Row():
+                    prev_btn = gr.Button("◀ prev [←]", size="sm", elem_id="pvd-prev")
+                    next_btn = gr.Button("next [→] ▶", size="sm", elem_id="pvd-next")
 
+        hint = gr.Markdown(session.unchanged_hint())
         with gr.Row():
-            confirm_btn = gr.Button("Confirm & retrain", variant="primary")
-            undo_btn = gr.Button("Undo")
-            audit_btn = gr.Button("Audit mode")
-            quick_toggle = gr.Checkbox(label="Quick mode (click cycles labels)", value=False)
+            confirm_btn = gr.Button("Confirm & retrain [Enter]", variant="primary", elem_id="pvd-confirm")
+            undo_btn = gr.Button("Undo last batch")
 
-        outputs = [gallery, preview, detail, status]
+        outputs = [gallery, preview, detail, status, hint, mode_radio, *label_buttons]
 
         def on_select(evt: gr.SelectData):
             raw = evt.index
             position = int(raw[0]) if isinstance(raw, (list, tuple)) else int(raw)
+            session.select(position)
             if view_state["quick"]:
-                cycle = list(session.config.classes) + [session.config.skip_label]
-                current = session.current_label(position)
-                next_label = cycle[(cycle.index(current) + 1) % len(cycle)] if current in cycle else cycle[0]
-                session.set_label(position, next_label)
-            session.selected = position
+                session.cycle_label(position)
             return view(position)
 
         gallery.select(on_select, inputs=None, outputs=outputs)
 
         def make_set_label(label: str):
             def set_label_fn():
-                position = session.selected
-                if position is not None:
-                    session.set_label(position, label)
-                return view(position)
+                if session.selected is not None:
+                    session.set_label(session.selected, label)
+                return view(session.selected)
 
             return set_label_fn
 
         # One button per class (+ skip) so the UI works for any N (G20).
-        for label, button in label_buttons:
-            button.click(make_set_label(label), inputs=None, outputs=outputs)
+        for name, button in zip(label_names, label_buttons):
+            button.click(make_set_label(name), inputs=None, outputs=outputs)
+
+        prev_btn.click(lambda: view(session.move_selection(-1)), inputs=None, outputs=outputs)
+        next_btn.click(lambda: view(session.move_selection(+1)), inputs=None, outputs=outputs)
 
         def on_quick(flag: bool):
-            view_state["quick"] = flag
-            return flag
+            view_state["quick"] = bool(flag)
 
-        quick_toggle.change(on_quick, inputs=[quick_toggle], outputs=[quick_toggle])
+        quick_toggle.change(on_quick, inputs=[quick_toggle], outputs=None)
+
+        def on_mode(mode: str):
+            if mode != session.mode:
+                session.set_mode(mode)
+                session.last_action = f"Switched to {mode} mode."
+            return view(None)
+
+        mode_radio.input(on_mode, inputs=[mode_radio], outputs=outputs)
 
         def on_confirm():
             session.confirm()
-            session.selected = None
             return view(None)
 
         def on_undo():
             session.undo()
-            session.selected = None
-            return view(None)
-
-        def on_audit():
-            session.load_audit_batch()
-            session.selected = None
             return view(None)
 
         confirm_btn.click(on_confirm, inputs=None, outputs=outputs)
         undo_btn.click(on_undo, inputs=None, outputs=outputs)
-        audit_btn.click(on_audit, inputs=None, outputs=outputs)
 
     return demo
 
 
 def run_review(config: Config) -> None:
-    """Build the session and launch the app (called from the CLI)."""
-    from .scan import load_manifest  # noqa: F401 - fail clearly if no manifest
-
+    """Build the session and launch the app on localhost only (called from the CLI)."""
     session = ReviewSession(config)
     demo = build_app(session)
-    demo.launch()
+    # Previews are served straight from the data folders; allow exactly those.
+    allowed = [str(p) for p in (config.pool_dir, config.seed_dir, config.test_dir, config.thumbs_dir)]
+    demo.launch(server_name="127.0.0.1", share=False, head=KEYBOARD_JS, allowed_paths=allowed)

@@ -96,7 +96,7 @@ def test_status_mentions_metrics(tmp_project: Config) -> None:
     session = ReviewSession(tmp_project)
     status = session.status_markdown()
     assert "Test balanced accuracy" in status
-    assert "model:" in status
+    assert "Model: linear probe" in status
 
 
 def test_build_app_constructs(tmp_project: Config) -> None:

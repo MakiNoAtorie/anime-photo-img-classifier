@@ -30,7 +30,7 @@ from torchvision.transforms import v2
 
 from .config import Config
 from .device import pick_device
-from .evaluate import evaluate_arrays, render_report, resolve_test_set, write_report
+from .evaluate import evaluate_bundle, render_report, resolve_test_set, write_report
 from .imageio import load_rgb
 from .labels import effective_labels, label_snapshot_sha
 from .scan import load_manifest
@@ -75,12 +75,14 @@ class _Dataset(Dataset):
 
 
 def _build_model(model_name: str, num_classes: int, pretrained: bool):
+    """A timm model with a fresh ``num_classes`` head."""
     import timm
 
     return timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
 
 
 def _transforms(model, image_size: int):
+    """Train/eval transforms; see the module docstring for the augmentation policy."""
     import timm
 
     data_config = timm.data.resolve_model_data_config(model)
@@ -111,12 +113,17 @@ def _transforms(model, image_size: int):
 
 
 def _split_parameters(model):
+    """Split parameters into (new classifier head, pretrained backbone).
+
+    The head is found through timm's ``get_classifier()`` rather than by name
+    matching: names like ``fc`` also occur inside every ConvNeXt/ViT block
+    (``mlp.fc1``/``fc2``), which would put most of the backbone on the 10x
+    higher head learning rate.
+    """
+    head_ids = {id(param) for param in model.get_classifier().parameters()}
     head, backbone = [], []
-    for name, param in model.named_parameters():
-        if any(key in name for key in ("head", "fc", "classifier", "last_linear")):
-            head.append(param)
-        else:
-            backbone.append(param)
+    for param in model.parameters():
+        (head if id(param) in head_ids else backbone).append(param)
     return head, backbone
 
 
@@ -134,8 +141,14 @@ def _versions() -> dict:
 
 
 @torch.inference_mode()
-def finetune_predict_proba(bundle: FinetuneBundle, paths: list[str], config: Config) -> np.ndarray:
-    """Predict probabilities for image paths with a fine-tuned bundle."""
+def finetune_predict_proba(
+    bundle: FinetuneBundle, paths: list[str], config: Config
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(probs, valid)`` for image paths with a fine-tuned bundle.
+
+    Undecodable images get ``valid=False`` and NaN probabilities instead of
+    aborting the whole run.
+    """
     device = pick_device(config.device)
     model = _build_model(bundle.model_name, len(bundle.classes), pretrained=False)
     checkpoint = torch.load(config.resolve(bundle.checkpoint), map_location="cpu", weights_only=True)
@@ -152,15 +165,23 @@ def finetune_predict_proba(bundle: FinetuneBundle, paths: list[str], config: Con
         ]
     )
     bg = tuple(config.image.alpha_background)
-    probs = []
+    probs = np.full((len(paths), len(bundle.classes)), np.nan, dtype=np.float64)
+    valid = np.zeros(len(paths), dtype=bool)
     batch_size = config.finetune.batch_size
     for start in range(0, len(paths), batch_size):
-        chunk = paths[start : start + batch_size]
-        tensors = [eval_tf(load_rgb(Path(p), bg, config.image.max_pixels)) for p in chunk]
-        batch = torch.stack(tensors).to(device)
-        logits = model(batch)
-        probs.append(torch.softmax(logits.float(), dim=1).cpu().numpy())
-    return np.concatenate(probs, axis=0) if probs else np.zeros((0, len(bundle.classes)))
+        tensors, rows = [], []
+        for offset, path in enumerate(paths[start : start + batch_size]):
+            try:
+                tensors.append(eval_tf(load_rgb(Path(path), bg, config.image.max_pixels)))
+                rows.append(start + offset)
+            except Exception as exc:  # noqa: BLE001 - one bad file must not stop the run
+                log.error("Could not load %s: %s", path, exc)
+        if not tensors:
+            continue
+        logits = model(torch.stack(tensors).to(device))
+        probs[rows] = torch.softmax(logits.float(), dim=1).cpu().numpy()
+        valid[rows] = True
+    return probs, valid
 
 
 def run_finetune(config: Config) -> Path:
@@ -178,10 +199,17 @@ def run_finetune(config: Config) -> Path:
 
     paths = [str(config.resolve(p)) for p in labels["path"].tolist()]
     y = np.array([class_to_index[label] for label in labels["label"]], dtype=int)
+    # A stratified split needs at least one validation image per class.
+    n_val = max(int(round(config.finetune.val_fraction * len(y))), len(config.classes))
+    if len(y) - n_val < len(config.classes):
+        raise ValueError(
+            f"Too few labeled images ({len(y)}) for a stratified train/val split over "
+            f"{len(config.classes)} classes; label more images first."
+        )
     train_paths, val_paths, y_train, y_val = train_test_split(
         paths,
         y,
-        test_size=config.finetune.val_fraction,
+        test_size=n_val,
         stratify=y,
         random_state=config.seed,
     )
@@ -267,7 +295,7 @@ def run_finetune(config: Config) -> Path:
         classes=list(config.classes),
         model_name=config.finetune.model_name,
         image_size=config.finetune.image_size,
-        checkpoint=checkpoint_path.relative_to(config.project_root).as_posix(),
+        checkpoint=config.relative(checkpoint_path),
         mean=mean,
         std=std,
         val_balanced_accuracy=float(best_ba),
@@ -319,29 +347,41 @@ def _validate(model, loader, device: str) -> float:
 
 
 def _evaluate_test(config: Config, bundle: FinetuneBundle):
+    """Test-set EvalResult for the fine-tuned model, or None without a test set."""
     try:
         test = resolve_test_set(config)
     except ValueError:
         return None
-    probs = finetune_predict_proba(bundle, test.paths, config)
-    return evaluate_arrays(test.y_true, probs, bundle.classes, test.frame, test.tags)
+    return evaluate_bundle(config, bundle, test)
 
 
 def _compare_with_probe(config: Config, result) -> list[str]:
-    """Report the best probe's test score next to the fine-tuned one."""
+    """Re-score the newest probe on *today's* test set, next to the fine-tune.
+
+    Stored probe metrics may come from an older test set, so the probe is
+    evaluated again here; the table is per tag, where the differences matter.
+    """
     from .probe import load_latest, load as load_probe
 
+    if result is None:
+        return ["No test set, so no probe comparison.", ""]
     try:
         path = load_latest(config)
-        probe = load_probe(path)
-        if probe.test_metrics and result is not None:
-            return [
-                "## Probe vs fine-tune (same test set)",
-                "",
-                f"- Probe (`{path.name}`): balanced accuracy **{probe.test_metrics['balanced_accuracy']:.3f}**",
-                f"- Fine-tune (`{config.finetune.model_name}`): balanced accuracy **{result.balanced_accuracy:.3f}**",
-                "",
-            ]
-    except FileNotFoundError:
-        pass
-    return ["No probe bundle found to compare against.", ""]
+        probe_result = evaluate_bundle(config, load_probe(path))
+    except (FileNotFoundError, ValueError) as exc:
+        return [f"No probe to compare against ({exc}).", ""]
+
+    lines = [
+        "## Probe vs fine-tune (same test set, evaluated now)",
+        "",
+        "| slice | probe | fine-tune |",
+        "|---|---|---|",
+        f"| overall balanced accuracy | {probe_result.balanced_accuracy:.3f} | {result.balanced_accuracy:.3f} |",
+    ]
+    for tag in sorted(set(probe_result.per_tag) | set(result.per_tag)):
+        probe_acc = probe_result.per_tag.get(tag, {}).get("accuracy")
+        fine_acc = result.per_tag.get(tag, {}).get("accuracy")
+        fmt = lambda v: "n/a" if v is None else f"{v:.3f}"  # noqa: E731
+        lines.append(f"| tag `{tag}` accuracy | {fmt(probe_acc)} | {fmt(fine_acc)} |")
+    lines += ["", f"Probe bundle: `{path.name}`", ""]
+    return lines

@@ -110,7 +110,7 @@ def test_deleting_cache_forces_recompute(tmp_project: Config) -> None:
     assert embedding_cache_path(cfg, key).exists()
 
 
-def test_rename_does_not_recompute(tmp_project: Config) -> None:
+def test_rename_does_not_recompute(tmp_project: Config, monkeypatch) -> None:
     cfg = _fake_config(tmp_project)
     _populate(cfg, n=1)
     run_scan(cfg)
@@ -122,6 +122,14 @@ def test_rename_does_not_recompute(tmp_project: Config) -> None:
     renamed = cfg.seed_dir / "photo" / "p0_renamed.png"
     source.rename(renamed)
     run_scan(cfg)
+
+    # Nothing may be recomputed: building the backbone at all is a failure.
+    import pvd.features as features
+
+    def no_backbone(*args, **kwargs):
+        raise AssertionError("rename triggered recomputation")
+
+    monkeypatch.setattr(features, "build_backbone", no_backbone)
     run_embed(cfg)
     after, _ = load_embedding_cache(cfg, key)
 

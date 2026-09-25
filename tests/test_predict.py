@@ -66,10 +66,11 @@ def test_predict_never_overwrites(tmp_project: Config) -> None:
     src = _make_src(tmp_project)
     dst = tmp_project.project_root / "out"
     run_predict(tmp_project, src, dst, mode="copy")
+    first = {p: p.read_bytes() for p in dst.rglob("*.png")}
     run_predict(tmp_project, src, dst, mode="copy")
-    # Two runs of the same source names must produce distinct files.
-    copied = list((dst / "photo").glob("*.png")) + list((dst / "drawing").glob("*.png"))
-    assert len(copied) == len({p.name for p in copied})
+    # The second run adds new files next to the first run's, never over them.
+    assert len(list(dst.rglob("*.png"))) == 2 * len(first)
+    assert all(path.read_bytes() == data for path, data in first.items())
 
 
 def test_predict_move_requires_yes(tmp_project: Config) -> None:

@@ -29,12 +29,13 @@ def test_label_error_suspects_finds_flipped_labels(tmp_project: Config) -> None:
     flipped: set[str] = set()
     for split in ("photo", "drawing"):
         (tmp_project.seed_dir / split).mkdir(parents=True, exist_ok=True)
-    # Correct examples.
-    for i in range(15):
+    # Correct examples: 38 per class. Plus 2 flipped per class = 4 of 80 = 5%,
+    # the M6 acceptance rate.
+    for i in range(38):
         photo_image(seed=i).save(tmp_project.seed_dir / "photo" / f"p{i}.png")
         drawing_image(seed=i).save(tmp_project.seed_dir / "drawing" / f"d{i}.png")
     # Deliberately mislabeled examples (drawings in photo, photos in drawing).
-    for j in range(3):
+    for j in range(2):
         path = tmp_project.seed_dir / "photo" / f"wrong_d{j}.png"
         drawing_image(seed=900 + j).save(path)
         flipped.add(sha1_file(path))

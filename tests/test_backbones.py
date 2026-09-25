@@ -47,11 +47,12 @@ def test_unknown_backbone_raises() -> None:
 
 def test_registry_model_names_exist() -> None:
     """VERIFY the pinned model/pretrained names still exist (no download)."""
-    import open_clip
+    open_clip = pytest.importorskip("open_clip")
 
     pretrained = open_clip.list_pretrained()
     assert ("ViT-SO400M-14-SigLIP", "webli") in pretrained
     assert ("ViT-L-14", "laion2b_s32b_b82k") in pretrained
+    assert ("ViT-SO400M-14-SigLIP-384", "webli") in pretrained
 
     timm = pytest.importorskip("timm")
     names = set(timm.list_models())

@@ -20,7 +20,7 @@ def test_roundtrip_default_config(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     write_default_config(path)
     cfg = load_config(path)
-    assert cfg == Config(project_root=cfg.project_root) or cfg.classes == ["photo", "drawing"]
+    assert cfg == Config(project_root=cfg.project_root)
 
 
 def test_skip_label_cannot_be_a_class() -> None:

@@ -5,6 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
+
+pytest.importorskip("timm")
 
 from _imagegen import drawing_image, photo_image
 from pvd.config import Config

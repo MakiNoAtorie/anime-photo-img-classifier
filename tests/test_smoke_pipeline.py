@@ -14,13 +14,14 @@ from pvd.evaluate import run_eval
 from pvd.features import run_embed
 from pvd.predict import run_predict
 from pvd.probe import load, run_train
-from pvd.scan import run_scan
+from pvd.scan import load_manifest, run_scan
 
 
-def _seed(root: Path, folder: str, make, n: int, prefix: str) -> None:
+def _seed(root: Path, folder: str, make, n: int, prefix: str, start: int) -> None:
+    """Distinct seeds per split: identical bytes would be deduped (or leak)."""
     (root / folder).mkdir(parents=True, exist_ok=True)
     for i in range(n):
-        make(seed=1000 + i).save(root / folder / f"{prefix}_{folder}_{i}.png")
+        make(seed=start + i).save(root / folder / f"{prefix}_{folder}_{i}.png")
 
 
 def test_full_pipeline(tmp_project: Config) -> None:
@@ -28,12 +29,14 @@ def test_full_pipeline(tmp_project: Config) -> None:
     cfg.backbone.id = "fake"
     cfg.num_workers = 0
 
-    _seed(cfg.seed_dir, "photo", photo_image, 20, "s")
-    _seed(cfg.seed_dir, "drawing", drawing_image, 20, "s")
-    _seed(cfg.test_dir, "photo", photo_image, 5, "t")
-    _seed(cfg.test_dir, "drawing", drawing_image, 5, "t")
+    _seed(cfg.seed_dir, "photo", photo_image, 20, "s", start=1000)
+    _seed(cfg.seed_dir, "drawing", drawing_image, 20, "s", start=1000)
+    _seed(cfg.test_dir, "photo", photo_image, 5, "t", start=2000)
+    _seed(cfg.test_dir, "drawing", drawing_image, 5, "t", start=2000)
 
     run_scan(cfg)
+    manifest = load_manifest(cfg)
+    assert (manifest["status"] == "ok").all()  # no accidental duplicates
     run_embed(cfg)
     bundle_path = run_train(cfg)
     bundle = load(bundle_path)
@@ -43,8 +46,8 @@ def test_full_pipeline(tmp_project: Config) -> None:
     assert run_eval(cfg).exists()
 
     src = cfg.project_root / "inbox"
-    _seed(src, "photo", photo_image, 5, "new")
-    _seed(src, "drawing", drawing_image, 5, "new")
+    _seed(src, "photo", photo_image, 5, "new", start=3000)
+    _seed(src, "drawing", drawing_image, 5, "new", start=3000)
     csv_path = run_predict(cfg, src, cfg.project_root / "sorted", mode="copy")
     frame = pd.read_csv(csv_path)
     assert len(frame) == 10

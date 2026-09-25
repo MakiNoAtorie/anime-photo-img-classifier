@@ -63,8 +63,11 @@ def test_16bit_grayscale_scaled(tmp_path: Path) -> None:
     assert info.mode in ("I;16", "I;16B", "I;16L")
     image = load_rgb(path)
     assert image.mode == "RGB"
-    # Range should be spread out rather than clipped to one value.
-    assert np.asarray(image).std() > 1
+    # Uniform 16-bit noise must map onto the full 8-bit range. Naive clipping
+    # (Pillow's plain convert) gives mean ~255 and std ~4.
+    array = np.asarray(image)
+    assert array.min() <= 5 and array.max() >= 250
+    assert 110 < array.mean() < 145
 
 
 def test_truncated_jpeg_raises_broken(tmp_path: Path) -> None:
@@ -85,7 +88,11 @@ def test_animated_gif_uses_first_frame(tmp_path: Path) -> None:
     path = animated_gif(tmp_path / "a.gif")
     info = probe_image(path)
     assert info.n_frames == 3
-    assert load_rgb(path).mode == "RGB"
+    image = np.asarray(load_rgb(path))
+    # Each synthetic frame marks one pixel in row 0: frame 0 marks x=0 (value 3),
+    # frame 1 marks x=1 (value 20). Frame 0 must be the one loaded.
+    assert tuple(image[0, 0]) == (3, 3, 3)
+    assert tuple(image[0, 1]) == (255, 255, 255)
 
 
 def test_exif_orientation_swaps_dimensions(tmp_path: Path) -> None:

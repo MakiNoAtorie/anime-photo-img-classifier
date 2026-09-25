@@ -36,7 +36,9 @@ def test_batch_and_select(tmp_project: Config) -> None:
     assert len(session.candidate_positions()) == 20
     item = session.select(0)
     assert item is not None
-    # Selecting does not change the label.
+    assert session.selected == 0
+    # Selecting does not change (or record) a label.
+    assert session.pending == {}
     assert session.current_label(0) == item.model_pred
     assert session.changed(0) is False
     session.set_label(0, "drawing")

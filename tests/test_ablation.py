@@ -35,5 +35,11 @@ def test_ablation_table_and_recommendation(tmp_project: Config) -> None:
     assert "Ablation report" in text
     assert "fake" in text
     assert "Recommendation" in text
-    # Both rows completed without error.
-    assert "| fake |" in text
+    # Both rows completed without error: every row has a CV score and no note.
+    rows = [line for line in text.splitlines() if line.startswith("| fake")]
+    assert len(rows) == 2
+    for row in rows:
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        assert cells[1] != "n/a", row
+        assert cells[-1] == "", row
+    assert "| configuration | CV balanced acc | test balanced acc |" in text

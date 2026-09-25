@@ -42,7 +42,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# Real-model tests download weights; run them explicitly with `pytest -m slow`.
+addopts = "-q -m 'not slow'"
 markers = [
     "slow: tests that download or run real models (deselected by default)",
 ]

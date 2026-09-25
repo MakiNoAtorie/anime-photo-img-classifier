@@ -49,6 +49,7 @@ class LabelEvent:
     ts: str = field(default_factory=_now)
 
     def to_json(self) -> str:
+        """One compact JSON line; ``None`` fields are omitted to keep the log small."""
         payload = {k: v for k, v in asdict(self).items() if v is not None}
         return json.dumps(payload, sort_keys=True)
 
@@ -83,6 +84,7 @@ class LabelStore:
 
     # -- state --------------------------------------------------------------
     def history(self) -> list[LabelEvent]:
+        """All events in file order (a copy), including undo events."""
         return list(self._events)
 
     def _undone_batches(self) -> set[str]:
@@ -105,6 +107,7 @@ class LabelStore:
         return state
 
     def next_batch_id(self) -> str:
+        """Next ``bNNNN`` id; ids are never reused, even after an undo."""
         numbers = [
             int(e.batch_id[1:])
             for e in self._events

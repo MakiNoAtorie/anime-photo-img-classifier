@@ -15,6 +15,20 @@ undo progress, so decide early.
 
 Label by **how the depicted content was made**, not by the file's history.
 
+## Decisions confirmed by Dev (2026-09-24)
+
+The plan left three cases open until they were confirmed. They are now settled
+and match the table below:
+
+| Open question | Decision |
+|---|---|
+| AI-generated realistic images | `skip` (no `ai_generated` class for now) |
+| 3D renders, CGI, 3D game screenshots | `skip` (no `cg_render` class for now) |
+| Photo of a painting in a museum (frame, wall, people visible) | `photo` |
+
+Changing any of these later means relabeling the affected images, so record the
+date and the reason here if you do.
+
 ## Edge cases
 
 | Case | Label | Rationale |
@@ -53,5 +67,7 @@ is generator-specific artifacts and detectors decay as new generators appear.
 
 1. Default: label AI-generated realistic images `skip`.
 2. To track them, add a class `ai_generated` to `classes` and accept moderate
-   accuracy, tracked separately in per-tag metrics.
+   accuracy, tracked separately in per-tag metrics. Also add zero-shot prompts
+   for it under `zeroshot.prompts`, or the review app stays in "labels needed"
+   mode until every class has 5 labels.
 3. A dedicated detector can be added later as a separate stage.

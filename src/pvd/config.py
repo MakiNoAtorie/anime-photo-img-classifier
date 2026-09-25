@@ -297,6 +297,7 @@ class Config(BaseModel):
         except ValueError:
             return absolute.as_posix()
 
+    # Absolute locations of every input/output, derived from ``paths``.
     @property
     def pool_dir(self) -> Path:
         return self.resolve(self.paths.pool)

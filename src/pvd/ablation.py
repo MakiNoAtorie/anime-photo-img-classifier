@@ -28,6 +28,7 @@ SPEED_SAMPLE = 16
 
 @dataclass
 class AblationSpec:
+    """One row of the ablation grid: a backbone plus which optional feature blocks to add."""
     name: str
     backbone: str
     tiles: bool = False
@@ -144,6 +145,7 @@ def _fmt(value) -> str:
 
 
 def render_ablation(rows: list[dict]) -> str:
+    """Markdown table of all configurations plus a recommendation computed from the numbers."""
     lines = ["# Ablation report", ""]
     lines.append("| configuration | CV balanced acc | test balanced acc | realistic_drawing | filtered_photo | s / 1k | note |")
     lines.append("|---|---|---|---|---|---|---|")

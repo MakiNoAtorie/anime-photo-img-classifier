@@ -46,16 +46,19 @@ class FakeBackbone:
         self._bias = torch.randn(dim, generator=generator)
 
     def to(self, device: str) -> "FakeBackbone":  # pragma: no cover - trivial
+        """Move the projection to ``device`` (mirrors the real backbones' API)."""
         self._projection = self._projection.to(device)
         self._bias = self._bias.to(device)
         return self
 
     def encode(self, batch: torch.Tensor) -> torch.Tensor:
+        """Project flattened pixels and L2-normalize; deterministic across runs."""
         flat = batch.flatten(start_dim=1)
         projected = flat @ self._projection.to(flat.device) + self._bias.to(flat.device)
         return l2_normalize(F.relu(projected))
 
     def encode_text(self, prompts: list[str]) -> torch.Tensor | None:
+        """The plain fake backbone is not text-aligned (returns None)."""
         return None
 
     def meta(self) -> dict:
@@ -74,6 +77,7 @@ class FakeTextBackbone(FakeBackbone):
     logit_scale = 100.0
 
     def encode_text(self, prompts: list[str]) -> torch.Tensor:
+        """Deterministic unit vectors per prompt, so zero-shot code runs offline."""
         rows = []
         for prompt in prompts:
             seed = sum(ord(ch) * (i + 1) for i, ch in enumerate(prompt)) % (2**31)

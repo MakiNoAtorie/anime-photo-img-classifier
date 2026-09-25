@@ -94,6 +94,7 @@ def resolve_test_set(config: Config, manifest: pd.DataFrame | None = None) -> Te
 # --------------------------------------------------------------------------- #
 @dataclass
 class EvalResult:
+    """Every metric one evaluation produces; rendered by :func:`render_report`."""
     classes: list[str]
     accuracy: float
     balanced_accuracy: float
@@ -251,6 +252,7 @@ def worst_errors(
     classes: list[str],
     limit: int = 12,
 ) -> list[dict]:
+    """The most confident wrong predictions: the first images worth looking at."""
     confidence = probs.max(axis=1)
     wrong = np.where(y_true != y_pred)[0]
     wrong = wrong[np.argsort(-confidence[wrong])][:limit]

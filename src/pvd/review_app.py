@@ -240,6 +240,7 @@ class ReviewSession:
         return {sha for sha, label in self.store.current().items() if label in valid}
 
     def candidate_positions(self) -> list[int]:
+        """Pool rows that still need a decision (vectorized for large pools)."""
         is_pool = (self.ok["split"] == "pool").to_numpy()
         labeled = self.ok["sha1"].isin(self.labeled_shas()).to_numpy()
         return np.flatnonzero(is_pool & ~labeled).tolist()
@@ -327,6 +328,7 @@ class ReviewSession:
         return self.selected
 
     def set_label(self, position: int, label: str) -> None:
+        """Record the reviewer's label for an item (saved on confirm)."""
         if 0 <= position < len(self.batch):
             self.pending[position] = label
 
@@ -347,14 +349,17 @@ class ReviewSession:
         return next_label
 
     def current_label(self, position: int) -> str | None:
+        """The label that confirm would save for this item right now."""
         if position in self.pending:
             return self.pending[position]
         return self.batch[position].default_label
 
     def changed(self, position: int) -> bool:
+        """True if the reviewer changed the item away from its default label."""
         return position in self.pending and self.pending[position] != self.batch[position].default_label
 
     def path_of(self, position: int) -> Path:
+        """Absolute path of an item's original file (for the full-res preview)."""
         return Path(self.batch[position].path_abs)
 
     # -- confirm / undo -----------------------------------------------------
@@ -467,6 +472,7 @@ class ReviewSession:
         return {name: int(counts.get(name, 0)) for name in self.config.classes}
 
     def batch_labels(self) -> list[str]:
+        """Current label of every item in the batch, in gallery order."""
         return [self.current_label(i) or "?" for i in range(len(self.batch))]
 
     def unchanged_hint(self) -> str:
@@ -478,6 +484,7 @@ class ReviewSession:
         return "⚠️ Untouched images are saved **as the model's guess** when you press Confirm — check each one."
 
     def status_markdown(self) -> str:
+        """Status bar: mode, counts, model state, test accuracy and last batch."""
         counts = self.labeled_counts()
         count_text = ", ".join(f"{name}={counts[name]}" for name in self.config.classes)
         ba = f"{self.last_test_ba * 100:.1f}%" if self.last_test_ba is not None else "n/a"

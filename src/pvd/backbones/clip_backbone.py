@@ -51,18 +51,21 @@ class ClipBackbone:
         raise RuntimeError(f"Could not infer embedding dim for {self.model_name}")
 
     def encode(self, batch: torch.Tensor) -> torch.Tensor:
+        """Embed a preprocessed batch; returns L2-normalized float32 ``(B, dim)``."""
         batch = batch.to(self._device)
         with torch.inference_mode():
             features = self.model.encode_image(batch)
         return l2_normalize(features.float())
 
     def encode_text(self, prompts: list[str]) -> torch.Tensor | None:
+        """Embed prompts into the same space as images (used for zero-shot)."""
         tokens = self.tokenizer(prompts).to(self._device)
         with torch.inference_mode():
             features = self.model.encode_text(tokens)
         return l2_normalize(features.float())
 
     def meta(self) -> dict:
+        """Serializable identity stored in the embedding cache (model, weights, size)."""
         return {
             "backbone": self.id,
             "library": "open_clip",

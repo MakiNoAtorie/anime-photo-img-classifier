@@ -13,6 +13,7 @@ from .base import Backbone, TransformPreprocess, l2_normalize
 
 
 class DINOv2Backbone:
+    """Self-supervised DINOv2 via timm: strong on texture, no text encoder."""
     is_text_aligned = False
 
     def __init__(self, backbone_id: str, model_name: str, device: str) -> None:
@@ -31,15 +32,18 @@ class DINOv2Backbone:
         self.dim = int(self.model.num_features)
 
     def encode(self, batch: torch.Tensor) -> torch.Tensor:
+        """Embed a preprocessed batch; returns L2-normalized float32 ``(B, dim)``."""
         batch = batch.to(self._device)
         with torch.inference_mode():
             features = self.model(batch)
         return l2_normalize(features.float())
 
     def encode_text(self, prompts: list[str]) -> torch.Tensor | None:
+        """DINOv2 has no text encoder, so zero-shot is unavailable (returns None)."""
         return None
 
     def meta(self) -> dict:
+        """Serializable identity stored in the embedding cache (model, size, dim)."""
         return {
             "backbone": self.id,
             "library": "timm",

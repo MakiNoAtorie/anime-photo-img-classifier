@@ -95,6 +95,7 @@ def feature_recipe(backbone_id: str, config: Config) -> dict:
 # Cache I/O
 # --------------------------------------------------------------------------- #
 def embedding_cache_path(config: Config, key: str) -> Path:
+    """Main cache file for a feature key (checkpoint shards sit next to it)."""
     return config.embeddings_dir / f"{key}.npz"
 
 
@@ -181,12 +182,15 @@ class _Checkpointer:
         self.failed: dict[str, str] = {}
 
     def add(self, sha: str, vector: np.ndarray) -> None:
+        """Queue a freshly computed vector for the next checkpoint shard."""
         self.pending[sha] = vector
 
     def fail(self, sha: str, error: str) -> None:
+        """Remember an image whose bytes cannot be decoded, so it is not retried."""
         self.failed[sha] = error
 
     def flush(self) -> None:
+        """Write queued vectors/failures as a new shard and clear the queue."""
         if not self.pending and not self.failed:
             return
         self.config.embeddings_dir.mkdir(parents=True, exist_ok=True)

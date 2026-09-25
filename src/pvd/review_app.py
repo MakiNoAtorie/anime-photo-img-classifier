@@ -385,7 +385,9 @@ class ReviewSession:
                     sampled_as=item.sampled_as,
                 )
             )
-            if item.sampled_as != "audit":
+            # Error rates only count real class decisions: `skip` means "out of
+            # scope", not "the model was wrong".
+            if item.sampled_as != "audit" and final != self.config.skip_label:
                 is_wrong = final != item.model_pred
                 wrong.append(is_wrong)
                 if item.sampled_as == "random":
@@ -542,12 +544,17 @@ document.addEventListener('keydown', (event) => {
 
 
 def _contact_sheet(session: ReviewSession) -> list[tuple[str, str]]:
-    """Gallery items: thumbnail + caption ``label (model confidence)`` + ``*`` if changed."""
+    """Gallery items: thumbnail + short caption.
+
+    Unchanged: ``label 0.83`` (the model's confidence). Changed: ``label ✱``;
+    the model's guess stays visible in the detail panel. Kept short because
+    captions are truncated under small thumbnails.
+    """
     items = []
     for position, item in enumerate(session.batch):
         thumb = make_thumbnail(session.config, item.sha1, Path(item.path_abs))
-        marker = " ✱" if session.changed(position) else ""
-        caption = f"{session.current_label(position)}{marker} · {item.model_pred} {item.model_conf:.2f}"
+        label = session.current_label(position)
+        caption = f"{label} ✱" if session.changed(position) else f"{label} {item.model_conf:.2f}"
         items.append((str(thumb), caption))
     return items
 
@@ -600,8 +607,7 @@ def build_app(session: ReviewSession):
                 gallery = gr.Gallery(
                     value=_contact_sheet(session),
                     columns=6,
-                    rows=4,
-                    height=560,
+                    height="auto",
                     object_fit="contain",
                     allow_preview=False,
                     label="Batch (click to select; ✱ = changed)",

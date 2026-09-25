@@ -52,7 +52,8 @@ seconds.
 - **Optional fine-tune:** a `timm` model trained on the collected labels.
 
 Read `LABEL_POLICY.md` before labeling anything — consistency matters more than
-any model choice.
+any model choice. For a full walkthrough and the theory behind each step, see
+[`TUTORIAL.md`](TUTORIAL.md).
 
 ## Requirements
 

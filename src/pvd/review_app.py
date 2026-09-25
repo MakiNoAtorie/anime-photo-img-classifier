@@ -36,7 +36,7 @@ from .evaluate import evaluate_arrays, resolve_test_set
 from .features import get_features, global_block, load_feature_meta
 from .imageio import load_rgb
 from .labels import LabelEvent, LabelStore, effective_labels
-from .probe import MIN_TRAIN_PER_CLASS, quick_retrain, train_probe
+from .probe import MIN_TRAIN_PER_CLASS, make_estimator, train_probe
 from .sampler import next_batch
 from .scan import load_manifest
 
@@ -170,7 +170,7 @@ class ReviewSession:
                 self.cv_balanced_accuracy = bundle.cv_balanced_accuracy
                 self.batches_since_cv = 0
             else:
-                self.model = quick_retrain(X, y, self.best_C, self.config)
+                self.model = make_estimator(self.best_C, self.config).fit(X, y)  # no CV (NF2)
             self.model_kind = "probe"
             self.model_reason = f"linear probe on {len(y)} labels (C={self.best_C:g})"
             return
@@ -217,15 +217,14 @@ class ReviewSession:
         if self.model_kind == "probe":
             self.probs = self.model.predict_proba(self.features)
         elif self.model_kind == "zeroshot":
-            from .zeroshot import class_text_centroids, softmax
+            from .zeroshot import class_text_centroids, zeroshot_probs
 
             backbone = self._get_backbone()
             if self._centroids is None:
                 self._centroids = class_text_centroids(
                     backbone, self.config.zeroshot.prompts, list(self.config.classes)
                 )
-            scale = getattr(backbone, "logit_scale", None) or 100.0
-            self.probs = softmax((self.global_features @ self._centroids.T) * scale)
+            self.probs = zeroshot_probs(backbone, self.global_features, self._centroids)
         else:
             self.probs = np.full((n, n_classes), 1.0 / n_classes)
 
@@ -268,7 +267,7 @@ class ReviewSession:
         self.selected = None
         return self.batch
 
-    def load_audit_batch(self, limit: int | None = None) -> list[SessionItem]:
+    def load_audit_batch(self) -> list[SessionItem]:
         """Replace the batch with likely label mistakes for re-review (G21).
 
         Unchanged audit items keep their stored label on confirm; only explicit
@@ -277,8 +276,8 @@ class ReviewSession:
         from .audit import label_error_suspects
 
         self.mode = "audit"
-        limit = limit if limit is not None else self.config.review.batch_size
-        suspects = label_error_suspects(self.config, self.manifest, store=self.store)[:limit]
+        suspects = label_error_suspects(self.config, self.manifest, store=self.store)
+        suspects = suspects[: self.config.review.batch_size]
         self.batch = []
         for suspect in suspects:
             position = self.sha_to_pos.get(suspect["sha1"])
@@ -357,10 +356,6 @@ class ReviewSession:
     def changed(self, position: int) -> bool:
         """True if the reviewer changed the item away from its default label."""
         return position in self.pending and self.pending[position] != self.batch[position].default_label
-
-    def path_of(self, position: int) -> Path:
-        """Absolute path of an item's original file (for the full-res preview)."""
-        return Path(self.batch[position].path_abs)
 
     # -- confirm / undo -----------------------------------------------------
     def confirm(self) -> dict:

@@ -25,6 +25,16 @@ log = logging.getLogger(__name__)
 
 SPEED_SAMPLE = 16
 
+# One report row; every metric is None until measured.
+_EMPTY_ROW = {
+    "cv_balanced_accuracy": None,
+    "test_balanced_accuracy": None,
+    "realistic_drawing": None,
+    "filtered_photo": None,
+    "embed_seconds_per_1k": None,
+    "error": None,
+}
+
 
 @dataclass
 class AblationSpec:
@@ -90,15 +100,7 @@ def _run_spec(config: Config, spec: AblationSpec, labels, test) -> dict:
         recipe=feature_recipe(spec.backbone, cfg),
     )
 
-    row = {
-        "name": spec.name,
-        "cv_balanced_accuracy": bundle.cv_balanced_accuracy,
-        "test_balanced_accuracy": None,
-        "realistic_drawing": None,
-        "filtered_photo": None,
-        "embed_seconds_per_1k": None,
-        "error": None,
-    }
+    row = {**_EMPTY_ROW, "name": spec.name, "cv_balanced_accuracy": bundle.cv_balanced_accuracy}
     if test is not None:
         result = evaluate_bundle(cfg, bundle, test)
         row["test_balanced_accuracy"] = result.balanced_accuracy
@@ -191,17 +193,7 @@ def run_ablation(config: Config, specs: list[AblationSpec] | None = None) -> Pat
             rows.append(_run_spec(config, spec, labels, test))
         except Exception as exc:  # noqa: BLE001 - record and continue
             log.error("Configuration %s failed: %s", spec.name, exc)
-            rows.append(
-                {
-                    "name": spec.name,
-                    "cv_balanced_accuracy": None,
-                    "test_balanced_accuracy": None,
-                    "realistic_drawing": None,
-                    "filtered_photo": None,
-                    "embed_seconds_per_1k": None,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
+            rows.append({**_EMPTY_ROW, "name": spec.name, "error": f"{type(exc).__name__}: {exc}"})
     report = write_report(config, "ablation", render_ablation(rows))
     log.info("Ablation report: %s", report)
     return report

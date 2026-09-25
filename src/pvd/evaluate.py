@@ -32,7 +32,7 @@ RESOLUTION_BUCKETS = [
     (0, 512, "<512"),
     (512, 1024, "512-1023"),
     (1024, 2048, "1024-2047"),
-    (2048, 10**9, ">=2048"),
+    (2048, float("inf"), ">=2048"),
 ]
 
 
@@ -196,8 +196,6 @@ def evaluate_arrays(
     if tags is not None:
         for tag in sorted({t for t in tags if t}):
             mask = np.array([t == tag for t in tags])
-            if mask.sum() == 0:
-                continue
             m = _basic_metrics(y_true[mask], y_pred[mask], classes)
             result.per_tag[tag] = {"n": m["n"], "accuracy": m["accuracy"], "balanced_accuracy": m["balanced_accuracy"]}
 
@@ -210,10 +208,7 @@ def evaluate_arrays(
 
 def _resolution_bucket(width: int, height: int) -> str:
     long_side = max(width, height)
-    for low, high, name in RESOLUTION_BUCKETS:
-        if low <= long_side < high:
-            return name
-    return ">2048"
+    return next(name for low, high, name in RESOLUTION_BUCKETS if low <= long_side < high)
 
 
 def bias_breakdowns(
@@ -234,8 +229,6 @@ def bias_breakdowns(
         groups: dict[str, dict[str, float]] = {}
         for bucket in sorted(set(values)):
             mask = np.array([v == bucket for v in values])
-            if mask.sum() == 0:
-                continue
             groups[str(bucket)] = {
                 "n": int(mask.sum()),
                 "accuracy": float((y_pred[mask] == y_true[mask]).mean()),
@@ -393,11 +386,21 @@ def evaluate_bundle(config: Config, bundle, test: TestSet | None = None) -> Eval
     return evaluate_arrays(test.y_true, probs, list(config.classes), test.frame, test.tags)
 
 
+def evaluate_if_test_set(config: Config, bundle, manifest: pd.DataFrame | None = None) -> EvalResult | None:
+    """:func:`evaluate_bundle`, or None (with a warning) when there is no test set."""
+    try:
+        test = resolve_test_set(config, manifest)
+    except ValueError as exc:
+        log.warning("Skipping test evaluation: %s", exc)
+        return None
+    return evaluate_bundle(config, bundle, test)
+
+
 def run_eval(config: Config, model: str | Path | None = None) -> Path:
     """Evaluate the newest (or given) bundle on the held-out test set."""
-    from .models import load_any, load_latest_any
+    from .models import load_any, newest_bundle_path
 
-    path = Path(model) if model else load_latest_any(config)
+    path = Path(model) if model else newest_bundle_path(config)
     bundle = load_any(path)
     result = evaluate_bundle(config, bundle)
     extra = [

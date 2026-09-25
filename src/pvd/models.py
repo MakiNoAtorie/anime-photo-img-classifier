@@ -33,7 +33,6 @@ from .imageio import sha1_file
 log = logging.getLogger(__name__)
 
 KNOWN_KINDS = {"probe", "finetune"}
-BUNDLE_PREFIXES = {"probe": "probe_", "finetune": "finetune_"}
 
 
 def load_any(path: Path):
@@ -54,7 +53,7 @@ def newest_bundle_path(config: Config, kinds: tuple[str, ...] = ("probe", "finet
     candidates = [
         path
         for kind in kinds
-        for path in config.models_dir.glob(f"{BUNDLE_PREFIXES[kind]}*.joblib")
+        for path in config.models_dir.glob(f"{kind}_*.joblib")
     ]
     if not candidates:
         wanted = " or ".join(kinds)
@@ -62,11 +61,6 @@ def newest_bundle_path(config: Config, kinds: tuple[str, ...] = ("probe", "finet
             f"No {wanted} model found in {config.models_dir}. Run `pvd train` first."
         )
     return max(candidates, key=lambda p: (p.stat().st_mtime, p.name))
-
-
-def load_latest_any(config: Config) -> Path:
-    """Newest bundle of any supported kind, or a clear error."""
-    return newest_bundle_path(config)
 
 
 def config_for_bundle(config: Config, bundle) -> Config:

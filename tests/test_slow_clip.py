@@ -21,7 +21,7 @@ def test_clip_b32_zeroshot_end_to_end(tmp_project: Config) -> None:
     from pvd.evaluate import resolve_test_set
     from pvd.features import get_features, global_block, load_feature_meta
     from pvd.backbones import build_backbone
-    from pvd.zeroshot import zeroshot_probs
+    from pvd.zeroshot import class_text_centroids, zeroshot_probs
 
     cfg = tmp_project
     cfg.backbone.id = "clip_b32"
@@ -38,6 +38,7 @@ def test_clip_b32_zeroshot_end_to_end(tmp_project: Config) -> None:
     assert valid.all()
     assert features.shape == (12, 512)
     backbone = build_backbone("clip_b32", "cpu")
-    probs = zeroshot_probs(backbone, global_block(features, load_feature_meta(cfg)), cfg.zeroshot.prompts, cfg.classes)
+    centroids = class_text_centroids(backbone, cfg.zeroshot.prompts, cfg.classes)
+    probs = zeroshot_probs(backbone, global_block(features, load_feature_meta(cfg)), centroids)
     accuracy = float((probs.argmax(axis=1) == test.y_true).mean())
     assert accuracy >= 0.75

@@ -28,6 +28,7 @@ mask so callers can drop them (and ``pvd embed`` marks them ``broken``).
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import logging
 import time
@@ -385,21 +386,10 @@ def _feature_dim_from_mapping(mapping: dict[str, np.ndarray]) -> int:
     return int(next(iter(mapping.values())).shape[0])
 
 
-def _versions() -> dict:
-    versions = {}
-    try:
-        import open_clip
-
-        versions["open_clip"] = open_clip.__version__
-    except Exception:  # pragma: no cover
-        pass
-    try:
-        import sklearn
-
-        versions["sklearn"] = sklearn.__version__
-    except Exception:  # pragma: no cover
-        pass
-    return {"torch": torch.__version__, **versions}
+def package_versions() -> dict:
+    """Installed versions of the packages that shape the numbers (caches, bundles)."""
+    names = ("torch", "torchvision", "timm", "open_clip_torch", "scikit-learn")
+    return {name: importlib.metadata.version(name) for name in names}
 
 
 def _build_meta(backbone, key: str, config: Config) -> dict:
@@ -420,7 +410,7 @@ def _build_meta(backbone, key: str, config: Config) -> dict:
             "tiles": backbone.dim if tiles.enabled else 0,
             "extra": 1 if deepghs else 0,
         },
-        "versions": _versions(),
+        "versions": package_versions(),
     }
 
 

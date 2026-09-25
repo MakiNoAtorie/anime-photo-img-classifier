@@ -48,16 +48,9 @@ def build_backbone(backbone_id: str, device: str = "cpu") -> Backbone:
         from .clip_backbone import ClipBackbone
 
         return ClipBackbone(backbone_id, model_name, pretrained or "", device)
-    if family == "dinov2":
-        from .dinov2_backbone import DINOv2Backbone
+    from .dinov2_backbone import DINOv2Backbone  # the only other family
 
-        return DINOv2Backbone(backbone_id, model_name, device)
-    raise ValueError(f"Unsupported backbone family: {family}")
+    return DINOv2Backbone(backbone_id, model_name, device)
 
 
-def backbone_dim(backbone_id: str, device: str = "cpu") -> int:
-    """Feature dimension of a backbone (loads the model if necessary)."""
-    return build_backbone(backbone_id, device).dim
-
-
-__all__ = ["Backbone", "MODEL_REGISTRY", "FAKE_ID", "build_backbone", "backbone_dim"]
+__all__ = ["Backbone", "MODEL_REGISTRY", "FAKE_ID", "build_backbone"]

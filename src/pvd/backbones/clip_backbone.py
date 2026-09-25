@@ -7,9 +7,8 @@ exposed so :mod:`pvd.zeroshot` can build prompt ensembles.
 from __future__ import annotations
 
 import torch
-from PIL import Image
 
-from .base import Backbone, TransformPreprocess, l2_normalize
+from .base import l2_normalize
 
 
 def _normalize_image_size(size: object) -> int:
@@ -35,7 +34,7 @@ class ClipBackbone:
         )
         self.model.eval()
         self.tokenizer = open_clip.get_tokenizer(model_name)
-        self.preprocess = TransformPreprocess(transform)
+        self.preprocess = transform  # torchvision Compose: picklable (G9)
         self.image_size = _normalize_image_size(self.model.visual.image_size)
         self.dim = self._infer_dim()
         scale = getattr(self.model, "logit_scale", None)

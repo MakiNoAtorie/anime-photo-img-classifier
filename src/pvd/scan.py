@@ -18,8 +18,7 @@ from pathlib import Path
 import pandas as pd
 
 from .config import Config
-from .imageio import ImageLoadError, probe_image, sha1_file
-from .imageio import load_rgb
+from .imageio import ImageLoadError, load_rgb, probe_image, sha1_file
 
 log = logging.getLogger(__name__)
 
@@ -80,13 +79,8 @@ def _locate(rel_parts: tuple[str, ...], split: str) -> tuple[str | None, str | N
         return None, None, rel_parts[0] if len(rel_parts) > 1 else "."
     folder_label = rel_parts[0] if len(rel_parts) > 1 else None
     nested = rel_parts[1:-1]
-    if split == "test":
-        tag = nested[0] if nested else None
-        source_dir = nested[-1] if nested else "."
-    else:
-        tag = None
-        source_dir = nested[-1] if nested else "."
-    return folder_label, tag, source_dir
+    tag = nested[0] if split == "test" and nested else None
+    return folder_label, tag, nested[-1] if nested else "."
 
 
 def _previous_rows(config: Config) -> dict[str, dict]:
@@ -169,7 +163,7 @@ def _discover(config: Config, incremental: bool = True) -> list[dict]:
                     )
                 except ImageLoadError as exc:
                     row["status"] = exc.reason
-                    row["error"] = exc.message
+                    row["error"] = str(exc)
                 except Exception as exc:  # pragma: no cover - safety net
                     row["status"] = "broken"
                     row["error"] = f"{type(exc).__name__}: {exc}"

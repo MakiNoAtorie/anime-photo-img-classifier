@@ -13,7 +13,8 @@ from pvd.config import Config
 from pvd.evaluate import run_eval
 from pvd.features import run_embed
 from pvd.predict import run_predict
-from pvd.probe import load, run_train
+from pvd.models import load_any as load
+from pvd.probe import run_train
 from pvd.scan import load_manifest, run_scan
 
 

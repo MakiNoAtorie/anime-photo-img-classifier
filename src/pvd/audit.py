@@ -183,8 +183,6 @@ def shortcut_analysis(config: Config, manifest: pd.DataFrame | None = None) -> d
         balance: dict[str, dict[str, int]] = {}
         for bucket in buckets:
             mask = values_array == bucket
-            if mask.sum() == 0:
-                continue
             counts = np.bincount(y[mask], minlength=len(config.classes))
             correct += int(counts.max())
             balance[bucket] = {cls: int(counts[i]) for i, cls in enumerate(config.classes)}

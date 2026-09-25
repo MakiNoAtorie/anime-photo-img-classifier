@@ -9,15 +9,8 @@ import pytest
 
 from _imagegen import drawing_image, photo_image
 from pvd.config import Config
-from pvd.probe import (
-    ProbeBundle,
-    load,
-    load_latest,
-    quick_retrain,
-    run_train,
-    save,
-    train_probe,
-)
+from pvd.models import load_any, newest_bundle_path
+from pvd.probe import ProbeBundle, make_estimator, run_train, save, train_probe
 from pvd.scan import run_scan
 
 
@@ -39,23 +32,18 @@ def test_train_probe_grid_search() -> None:
     assert bundle.n_train == len(y)
 
 
-def test_save_load_validation(tmp_path: Path) -> None:
+def test_save_load_roundtrip(tmp_path: Path) -> None:
     X, y = _separable()
     bundle = train_probe(X, y, Config(), classes=["photo", "drawing"], backbone_id="fake")
-    path = save(bundle, tmp_path / "probe.joblib")
-
-    loaded = load(path, expect_backbone_id="fake", expect_dim=8)
+    loaded = load_any(save(bundle, tmp_path / "probe.joblib"))
     assert loaded.classes == ["photo", "drawing"]
-
-    with pytest.raises(ValueError, match="backbone"):
-        load(path, expect_backbone_id="clip_b32")
-    with pytest.raises(ValueError, match="expects 8 features"):
-        load(path, expect_dim=99)
+    assert (loaded.backbone_id, loaded.feature_dim) == ("fake", 8)
 
 
-def test_quick_retrain_matches_C() -> None:
+def test_make_estimator_uses_C() -> None:
     X, y = _separable()
-    estimator = quick_retrain(X, y, C=10.0, config=Config())
+    estimator = make_estimator(10.0, Config()).fit(X, y)
+    assert estimator.C == 10.0
     assert estimator.predict(X).tolist() == y.tolist()
 
 
@@ -77,11 +65,12 @@ def test_run_train_end_to_end(tmp_project: Config) -> None:
     path = run_train(tmp_project)
     assert path.exists()
 
-    bundle = load(path, expect_backbone_id="fake")
+    bundle = load_any(path)
+    assert bundle.backbone_id == "fake"
     assert bundle.label_snapshot_sha
     assert bundle.test_metrics is not None
     assert bundle.test_metrics["balanced_accuracy"] > 0.9
-    assert load_latest(tmp_project) == path
+    assert newest_bundle_path(tmp_project, ("probe",)) == path
 
 
 def test_run_train_requires_enough_labels(tmp_project: Config) -> None:

@@ -22,7 +22,6 @@ from pathlib import Path
 import joblib
 import numpy as np
 import torch
-from PIL import Image
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
@@ -30,9 +29,12 @@ from torchvision.transforms import v2
 
 from .config import Config
 from .device import pick_device
-from .evaluate import evaluate_bundle, render_report, resolve_test_set, write_report
+from .evaluate import evaluate_bundle, evaluate_if_test_set, render_report, write_report
+from .features import package_versions
 from .imageio import load_rgb
 from .labels import effective_labels, label_snapshot_sha
+from .models import load_any, newest_bundle_path
+from .probe import MIN_TRAIN_PER_CLASS
 from .scan import load_manifest
 
 log = logging.getLogger(__name__)
@@ -100,7 +102,12 @@ def _transforms(model, image_size: int):
             v2.Normalize(mean=mean, std=std),
         ]
     )
-    eval_tf = v2.Compose(
+    return train_tf, _eval_transform(image_size, mean, std), mean, std
+
+
+def _eval_transform(image_size: int, mean: list[float], std: list[float]):
+    """Deterministic resize + center crop, shared by validation and prediction."""
+    return v2.Compose(
         [
             v2.Resize(image_size),
             v2.CenterCrop(image_size),
@@ -109,7 +116,6 @@ def _transforms(model, image_size: int):
             v2.Normalize(mean=mean, std=std),
         ]
     )
-    return train_tf, eval_tf, mean, std
 
 
 def _split_parameters(model):
@@ -127,19 +133,6 @@ def _split_parameters(model):
     return head, backbone
 
 
-def _versions() -> dict:
-    import timm
-
-    versions = {"torch": torch.__version__, "timm": timm.__version__}
-    try:
-        import torchvision
-
-        versions["torchvision"] = torchvision.__version__
-    except Exception:  # pragma: no cover
-        pass
-    return versions
-
-
 @torch.inference_mode()
 def finetune_predict_proba(
     bundle: FinetuneBundle, paths: list[str], config: Config
@@ -155,15 +148,7 @@ def finetune_predict_proba(
     model.load_state_dict(checkpoint["state_dict"])
     model.eval().to(device)
 
-    eval_tf = v2.Compose(
-        [
-            v2.Resize(bundle.image_size),
-            v2.CenterCrop(bundle.image_size),
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=bundle.mean, std=bundle.std),
-        ]
-    )
+    eval_tf = _eval_transform(bundle.image_size, bundle.mean, bundle.std)
     bg = tuple(config.image.alpha_background)
     probs = np.full((len(paths), len(bundle.classes)), np.nan, dtype=np.float64)
     valid = np.zeros(len(paths), dtype=bool)
@@ -193,9 +178,9 @@ def run_finetune(config: Config) -> Path:
 
     class_to_index = {name: i for i, name in enumerate(config.classes)}
     counts = labels["label"].value_counts()
-    small = [name for name in config.classes if counts.get(name, 0) < 5]
+    small = [name for name in config.classes if counts.get(name, 0) < MIN_TRAIN_PER_CLASS]
     if small:
-        raise ValueError(f"Not enough labeled examples for {small}; need >= 5 each.")
+        raise ValueError(f"Not enough labeled examples for {small}; need >= {MIN_TRAIN_PER_CLASS} each.")
 
     paths = [str(config.resolve(p)) for p in labels["path"].tolist()]
     y = np.array([class_to_index[label] for label in labels["label"]], dtype=int)
@@ -302,10 +287,10 @@ def run_finetune(config: Config) -> Path:
         n_train=int(len(y_train)),
         label_snapshot_sha=label_snapshot_sha(labels),
         config=config.to_dict(),
-        versions=_versions(),
+        versions=package_versions(),
     )
 
-    result = _evaluate_test(config, bundle)
+    result = evaluate_if_test_set(config, bundle)
     lines = [
         f"- Model: `{bundle.model_name}` @ {bundle.image_size}px",
         f"- Training examples: **{bundle.n_train}** (val fraction {config.finetune.val_fraction})",
@@ -346,28 +331,17 @@ def _validate(model, loader, device: str) -> float:
     return float(balanced_accuracy_score(truth, preds))
 
 
-def _evaluate_test(config: Config, bundle: FinetuneBundle):
-    """Test-set EvalResult for the fine-tuned model, or None without a test set."""
-    try:
-        test = resolve_test_set(config)
-    except ValueError:
-        return None
-    return evaluate_bundle(config, bundle, test)
-
-
 def _compare_with_probe(config: Config, result) -> list[str]:
     """Re-score the newest probe on *today's* test set, next to the fine-tune.
 
     Stored probe metrics may come from an older test set, so the probe is
     evaluated again here; the table is per tag, where the differences matter.
     """
-    from .probe import load_latest, load as load_probe
-
     if result is None:
         return ["No test set, so no probe comparison.", ""]
     try:
-        path = load_latest(config)
-        probe_result = evaluate_bundle(config, load_probe(path))
+        path = newest_bundle_path(config, ("probe",))
+        probe_result = evaluate_bundle(config, load_any(path))
     except (FileNotFoundError, ValueError) as exc:
         return [f"No probe to compare against ({exc}).", ""]
 

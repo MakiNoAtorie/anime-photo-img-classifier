@@ -202,7 +202,7 @@ def test_confirm_uses_quick_retrain_between_cv_runs(tmp_project: Config, monkeyp
     _review_project(tmp_project)
     tmp_project.review.cv_every = 3
     calls = {"cv": 0, "quick": 0}
-    real_train, real_quick = review_app.train_probe, review_app.quick_retrain
+    real_train, real_quick = review_app.train_probe, review_app.make_estimator
 
     def counting_train(*args, **kwargs):
         calls["cv"] += 1
@@ -213,7 +213,8 @@ def test_confirm_uses_quick_retrain_between_cv_runs(tmp_project: Config, monkeyp
         return real_quick(*args, **kwargs)
 
     monkeypatch.setattr(review_app, "train_probe", counting_train)
-    monkeypatch.setattr(review_app, "quick_retrain", counting_quick)
+    # train_probe builds its estimators inside pvd.probe, so this counts only quick refits.
+    monkeypatch.setattr(review_app, "make_estimator", counting_quick)
 
     session = review_app.ReviewSession(tmp_project)
     assert calls == {"cv": 1, "quick": 0}  # startup: one CV search
@@ -487,7 +488,8 @@ def test_sampler_tops_up_when_diversity_rejects() -> None:
 # --------------------------------------------------------------------------- #
 def test_eval_is_correct_after_classes_are_reordered(tmp_project: Config) -> None:
     from pvd.evaluate import evaluate_bundle
-    from pvd.probe import load, run_train
+    from pvd.models import load_any as load
+    from pvd.probe import run_train
 
     cfg = _fake(tmp_project)
     _seed(cfg, n=8, test=4)
@@ -504,7 +506,8 @@ def test_eval_is_correct_after_classes_are_reordered(tmp_project: Config) -> Non
 
 def test_predict_uses_bundle_recipe_not_current_config(tmp_project: Config) -> None:
     from pvd.predict import run_predict
-    from pvd.probe import load, run_train
+    from pvd.models import load_any as load
+    from pvd.probe import run_train
 
     cfg = _fake(tmp_project)
     _seed(cfg, n=8, test=2)

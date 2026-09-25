@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 
-from .base import Backbone, TransformPreprocess, l2_normalize
+from .base import l2_normalize
 
 
 class DINOv2Backbone:
@@ -26,8 +26,8 @@ class DINOv2Backbone:
         self.model.eval().to(device)
 
         data_config = timm.data.resolve_model_data_config(self.model)
-        self._transform = timm.data.create_transform(**data_config, is_training=False)
-        self.preprocess = TransformPreprocess(self._transform)
+        # A torchvision Compose: picklable, so DataLoader workers can use it (G9).
+        self.preprocess = timm.data.create_transform(**data_config, is_training=False)
         self.image_size = int(data_config["input_size"][-1])
         self.dim = int(self.model.num_features)
 

@@ -26,7 +26,7 @@ import pandas as pd
 
 from .config import Config
 from .imageio import ImageLoadError, probe_image, sha1_file
-from .models import load_any, load_latest_any, predict_proba_paths
+from .models import load_any, newest_bundle_path, predict_proba_paths
 from .scan import iter_images
 
 log = logging.getLogger(__name__)
@@ -67,7 +67,7 @@ def _collect_inputs(config: Config, src: Path) -> pd.DataFrame:
                 raise ImageLoadError("too_large", f"{info.width}x{info.height} exceeds max_pixels")
         except ImageLoadError as exc:
             row["status"] = exc.reason
-            row["error"] = exc.message
+            row["error"] = str(exc)
         except OSError as exc:
             row["status"] = BROKEN
             row["error"] = f"{type(exc).__name__}: {exc}"
@@ -104,7 +104,7 @@ def run_predict(
     if mode == "move" and not yes:
         raise ValueError("`--mode move` deletes files from the source. Re-run with --yes to confirm.")
 
-    bundle_path = Path(model) if model else load_latest_any(config)
+    bundle_path = Path(model) if model else newest_bundle_path(config)
     bundle = load_any(bundle_path)
     if set(bundle.classes) != set(config.classes):
         raise ValueError(f"Model classes {bundle.classes} != config classes {config.classes}.")

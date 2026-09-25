@@ -11,26 +11,9 @@ model cannot be (G9).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 import torch
-from PIL import Image
-
-
-@dataclass
-class TransformPreprocess:
-    """Picklable wrapper around a torchvision/timm transform.
-
-    Keeping this a standalone object (rather than a bound method on a model)
-    lets the embedding DataLoader use worker processes under the spawn start
-    method (G9).
-    """
-
-    transform: object
-
-    def __call__(self, image: Image.Image) -> torch.Tensor:
-        return self.transform(image)
 
 
 def l2_normalize(tensor: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
@@ -38,7 +21,6 @@ def l2_normalize(tensor: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     return tensor / tensor.norm(dim=-1, keepdim=True).clamp_min(eps)
 
 
-@runtime_checkable
 class Backbone(Protocol):
     """Minimal interface every embedding model must satisfy."""
 

@@ -18,8 +18,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
 
 from .config import Config
-from .evaluate import evaluate_bundle, render_report, resolve_test_set, write_report
-from .features import feature_recipe, get_features, load_feature_meta
+from .evaluate import evaluate_if_test_set, render_report, write_report
+from .features import feature_recipe, get_features, load_feature_meta, package_versions
 from .labels import effective_labels, label_snapshot_sha
 from .scan import load_manifest
 
@@ -50,20 +50,6 @@ class ProbeBundle:
     config: dict = field(default_factory=dict)
     created: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
     versions: dict = field(default_factory=dict)
-
-
-def _versions() -> dict:
-    import sklearn
-    import torch
-
-    versions = {"torch": torch.__version__, "sklearn": sklearn.__version__}
-    try:
-        import open_clip
-
-        versions["open_clip"] = open_clip.__version__
-    except Exception:  # pragma: no cover
-        pass
-    return versions
 
 
 def make_estimator(C: float, config: Config) -> LogisticRegression:
@@ -142,15 +128,8 @@ def train_probe(
         n_train=int(len(y)),
         label_snapshot_sha=label_snapshot,
         config=config.to_dict(),
-        versions=_versions(),
+        versions=package_versions(),
     )
-
-
-def quick_retrain(
-    X: np.ndarray, y: np.ndarray, C: float, config: Config
-) -> LogisticRegression:
-    """Fit without cross-validation, reusing the last chosen ``C`` (NF2)."""
-    return make_estimator(C, config).fit(X, y)
 
 
 def save(bundle: ProbeBundle, path: Path) -> Path:
@@ -160,51 +139,6 @@ def save(bundle: ProbeBundle, path: Path) -> Path:
     joblib.dump(bundle, path)
     log.info("Saved model bundle: %s", path)
     return path
-
-
-def load(
-    path: Path,
-    expect_backbone_id: str | None = None,
-    expect_dim: int | None = None,
-) -> ProbeBundle:
-    """Load a bundle, refusing mismatched feature recipes (G8)."""
-    bundle: ProbeBundle = joblib.load(path)
-    if not isinstance(bundle, ProbeBundle):
-        raise ValueError(f"{path} is not a ProbeBundle")
-    if expect_backbone_id is not None and bundle.backbone_id != expect_backbone_id:
-        raise ValueError(
-            f"Model was trained on backbone {bundle.backbone_id!r} but "
-            f"{expect_backbone_id!r} was requested. Retrain or pick the right model."
-        )
-    if expect_dim is not None and bundle.feature_dim != expect_dim:
-        raise ValueError(
-            f"Model expects {bundle.feature_dim} features but got {expect_dim}."
-        )
-    return bundle
-
-
-def load_latest(config: Config, kind: str = "probe") -> Path:
-    """Newest ``models/<kind>_*.joblib`` (chosen by name, without unpickling)."""
-    from .models import newest_bundle_path
-
-    return newest_bundle_path(config, (kind,))
-
-
-def _evaluate_bundle(config: Config, bundle: ProbeBundle, manifest=None):
-    """Evaluate a bundle on the test set; return an EvalResult or None."""
-    try:
-        test = resolve_test_set(config, manifest)
-    except ValueError as exc:
-        log.warning("Skipping test evaluation: %s", exc)
-        return None
-    if set(bundle.classes) != set(config.classes):
-        log.warning(
-            "Bundle classes %s differ from config classes %s; skipping eval",
-            bundle.classes,
-            config.classes,
-        )
-        return None
-    return evaluate_bundle(config, bundle, test)
 
 
 def run_train(config: Config) -> Path:
@@ -247,7 +181,7 @@ def run_train(config: Config) -> Path:
         recipe=recipe,
     )
 
-    result = _evaluate_bundle(config, bundle, manifest)
+    result = evaluate_if_test_set(config, bundle, manifest)
     if result is not None:
         bundle.test_metrics = {
             "accuracy": result.accuracy,

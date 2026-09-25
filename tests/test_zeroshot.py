@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from _imagegen import drawing_image, photo_image
-from pvd.zeroshot import class_text_centroids, softmax, zeroshot_probs
+from pvd.zeroshot import class_text_centroids, zeroshot_probs
 
 
 class StubTextBackbone:
@@ -37,11 +37,6 @@ class NoTextBackbone:
         return None
 
 
-def test_softmax_rows_sum_to_one() -> None:
-    out = softmax(np.array([[1.0, 2.0], [0.0, 0.0]]))
-    assert np.allclose(out.sum(axis=1), 1.0)
-
-
 def test_class_centroids_are_normalized() -> None:
     backbone = StubTextBackbone()
     centroids = class_text_centroids(
@@ -54,9 +49,10 @@ def test_class_centroids_are_normalized() -> None:
 def test_zeroshot_probs_argmax() -> None:
     backbone = StubTextBackbone()
     features = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=np.float32)
-    probs = zeroshot_probs(
-        backbone, features, {"photo": ["a photo"], "drawing": ["a drawing"]}, ["photo", "drawing"]
+    centroids = class_text_centroids(
+        backbone, {"photo": ["a photo"], "drawing": ["a drawing"]}, ["photo", "drawing"]
     )
+    probs = zeroshot_probs(backbone, features, centroids)
     assert probs.shape == (2, 2)
     assert probs.argmax(axis=1).tolist() == [0, 1]
 

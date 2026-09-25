@@ -21,17 +21,10 @@ _INSTALL_HINT = (
 )
 
 
-def _import_score_fn():
-    """Import the scoring function (the same import the scorer uses)."""
-    from imgutils.validate import anime_real_score
-
-    return anime_real_score
-
-
 def deepghs_available() -> bool:
     """True if ``dghs-imgutils`` and its anime/real scorer are importable."""
     try:
-        _import_score_fn()
+        from imgutils.validate import anime_real_score  # noqa: F401
     except Exception:
         return False
     return True
@@ -49,13 +42,11 @@ def real_score(path: Path | str) -> float:
     Accepts either a mapping ``{'anime': p, 'real': q}`` or a bare score,
     depending on the installed version. An unrecognized mapping raises instead
     of guessing, because picking the wrong key would silently invert the score.
+    Callers check :func:`require_deepghs` first.
     """
-    try:
-        score_fn = _import_score_fn()
-    except Exception as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError(_INSTALL_HINT) from exc
+    from imgutils.validate import anime_real_score
 
-    result = score_fn(str(path))
+    result = anime_real_score(str(path))
     if isinstance(result, dict):
         for key in _REAL_KEYS:
             if key in result:

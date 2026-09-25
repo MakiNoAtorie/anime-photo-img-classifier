@@ -24,7 +24,6 @@ from .config import Config
 log = logging.getLogger(__name__)
 
 VALID_SOURCES = {"seed_import", "review", "audit_fix", "undo"}
-VALID_SAMPLED_AS = {"uncertain", "random", "audit", None}
 
 
 def _now() -> str:
@@ -144,10 +143,6 @@ class LabelStore:
         batch_id = self.next_batch_id()
         for event in entries:
             event.batch_id = batch_id
-            if event.source not in VALID_SOURCES:
-                event.source = "review"
-            if event.sampled_as not in VALID_SAMPLED_AS:
-                event.sampled_as = None
             self._append(event)
         return batch_id
 

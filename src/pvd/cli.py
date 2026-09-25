@@ -55,7 +55,6 @@ def _guard(func):
                 typer.secho("(traceback above; run without --verbose to hide it)", err=True)
             raise typer.Exit(code=1) from exc
 
-    wrapper.__annotations__ = getattr(func, "__annotations__", {})
     return wrapper
 
 

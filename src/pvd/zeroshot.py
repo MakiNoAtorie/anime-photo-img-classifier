@@ -16,6 +16,7 @@ import logging
 from pathlib import Path
 
 import numpy as np
+from scipy.special import softmax
 
 from .config import Config
 from .device import pick_device
@@ -54,28 +55,14 @@ def class_text_centroids(backbone, prompts_by_class: dict[str, list[str]], class
     return centroids
 
 
-def softmax(logits: np.ndarray) -> np.ndarray:
-    """Numerically stable row-wise softmax."""
-    shifted = logits - logits.max(axis=1, keepdims=True)
-    exp = np.exp(shifted)
-    return exp / exp.sum(axis=1, keepdims=True)
-
-
-def zeroshot_probs(
-    backbone,
-    features: np.ndarray,
-    prompts_by_class: dict[str, list[str]],
-    classes: list[str],
-) -> np.ndarray:
-    """Return ``(N, C)`` probabilities from prompt-centroid similarity.
+def zeroshot_probs(backbone, features: np.ndarray, centroids: np.ndarray) -> np.ndarray:
+    """Return ``(N, C)`` probabilities from similarity to :func:`class_text_centroids`.
 
     ``features`` must be the **global** block only (see
     :func:`pvd.features.global_block`); tile/extra blocks are not text-aligned.
     """
-    centroids = class_text_centroids(backbone, prompts_by_class, classes)
     scale = getattr(backbone, "logit_scale", None) or 100.0
-    logits = (features @ centroids.T) * scale
-    return softmax(logits)
+    return softmax((features @ centroids.T) * scale, axis=1)
 
 
 def run_zeroshot(config: Config) -> Path:
@@ -97,7 +84,8 @@ def run_zeroshot(config: Config) -> Path:
     if not valid.all():
         test, features = test.subset(valid), features[valid]
     features = global_block(features, load_feature_meta(config))
-    probs = zeroshot_probs(backbone, features, config.zeroshot.prompts, config.classes)
+    centroids = class_text_centroids(backbone, config.zeroshot.prompts, config.classes)
+    probs = zeroshot_probs(backbone, features, centroids)
 
     result = evaluate_arrays(test.y_true, probs, list(config.classes), test.frame, test.tags)
     extra = [f"Backbone: `{config.backbone.id}` | prompts per class: "

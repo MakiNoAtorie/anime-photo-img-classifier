@@ -23,10 +23,8 @@ DIVERSITY_COSINE = 0.95
 def _top2_margin(probs: np.ndarray) -> np.ndarray:
     """Distance between the best and second-best class probability.
 
-    Smaller means more uncertain. Works for any number of classes.
+    Smaller means more uncertain. Works for any number (>= 2) of classes.
     """
-    if probs.shape[1] < 2:
-        return np.ones(len(probs), dtype=np.float64)
     sorted_probs = np.sort(probs, axis=1)
     return sorted_probs[:, -1] - sorted_probs[:, -2]
 

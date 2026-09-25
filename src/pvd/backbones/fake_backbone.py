@@ -11,6 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from torchvision.transforms.functional import pil_to_tensor
 
 from .base import l2_normalize
 
@@ -25,9 +26,7 @@ class _FakePreprocess:
         resized = image.convert("RGB").resize(
             (self.image_size, self.image_size), Image.BILINEAR
         )
-        array = torch.frombuffer(bytearray(resized.tobytes()), dtype=torch.uint8)
-        array = array.reshape(self.image_size, self.image_size, 3).permute(2, 0, 1)
-        return array.float() / 255.0
+        return pil_to_tensor(resized).float() / 255.0
 
 
 class FakeBackbone:

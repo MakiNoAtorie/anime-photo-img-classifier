@@ -31,7 +31,6 @@ dependencies = [
 [project.optional-dependencies]
 deepghs = ["dghs-imgutils>=0.19"]
 heic = ["pillow-heif>=0.16"]
-finetune = []  # kept for compatibility; timm is now a core dependency
 dev = ["pytest>=8"]
 
 [project.scripts]

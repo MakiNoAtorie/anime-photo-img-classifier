@@ -77,7 +77,7 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 # version from https://pytorch.org/get-started/locally/ , for example:
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
-pip install -e ".[dev]"              # or: pip install -r requirements.txt
+pip install -e ".[dev]"
 # optional extras: deepghs specialist model, iPhone HEIC photos
 pip install -e ".[deepghs,heic]"
 ```

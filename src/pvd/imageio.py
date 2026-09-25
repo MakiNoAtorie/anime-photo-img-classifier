@@ -48,8 +48,7 @@ _ALLOWED_FORMATS = ["JPEG", "PNG", "WEBP", "BMP", "GIF", "TIFF"]
 
 def allowed_formats() -> list[str]:
     """Pillow format names this project will decode."""
-    extra = [name for name in ("HEIF",) if name in Image.OPEN]
-    return _ALLOWED_FORMATS + extra
+    return _ALLOWED_FORMATS + (["HEIF"] if "HEIF" in Image.OPEN else [])
 
 
 # Modes that carry an alpha channel.
@@ -61,8 +60,7 @@ class ImageLoadError(Exception):
 
     def __init__(self, reason: str, message: str = "") -> None:
         self.reason = reason
-        self.message = message or reason
-        super().__init__(self.message)
+        super().__init__(message or reason)
 
 
 @dataclass(frozen=True)
@@ -91,17 +89,12 @@ def sha1_file(path: Path, chunk_size: int = 1 << 20) -> str:
 
 
 def _has_alpha(im: Image.Image) -> bool:
-    if im.mode in _ALPHA_MODES:
-        return True
-    if im.mode == "P" and "transparency" in im.info:
-        return True
-    return False
+    return im.mode in _ALPHA_MODES or (im.mode == "P" and "transparency" in im.info)
 
 
 def _read_info(im: Image.Image) -> ImageInfo:
     width, height = im.size
     # EXIF orientation 5-8 swap width and height.
-    orientation = 1
     try:
         orientation = im.getexif().get(0x0112, 1)
     except Exception:
@@ -167,12 +160,9 @@ def _to_rgb(im: Image.Image, bg: tuple[int, int, int]) -> Image.Image:
         return Image.alpha_composite(background, rgba).convert("RGB")
     if im.mode == "RGB":
         return im
-    if im.mode in ("L", "1"):
-        # Let Pillow dither 1-bit images into grayscale, then promote to RGB.
-        return im.convert("RGB")
     if im.mode in ("I;16", "I;16L", "I;16B", "I;16N", "I", "F"):
         return _scaled_array_to_rgb(np.asarray(im))
-    # CMYK, P (without transparency), YCbCr, LAB, HSV, ...
+    # L, 1, CMYK, P (without transparency), YCbCr, LAB, HSV, ...
     return im.convert("RGB")
 
 
